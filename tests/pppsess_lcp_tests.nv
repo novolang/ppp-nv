@@ -1,0 +1,777 @@
+// pppsess_lcp_tests.nv — LCP in the session: what is asked of this end, what
+// this end asks, and how the link is kept and ended.
+//
+// The packets are built from RFC 1661.  A Configure-Request that holds an
+// MRU of 1500 and a magic number is
+//
+//     01 01 00 0E | 01 04 05 DC | 05 06 12 34 56 78
+//
+// (code 1, identifier 1, length 14).  The reply to a request is a packet of
+// the same identifier whose code says what was decided: 2 acknowledges every
+// option as it came, 3 sends back a suggested value for each option it
+// would change, 4 sends back each option it will not do.  A request with both
+// kinds is answered with the Reject alone, because a peer that has had its
+// unknown options removed will send a new request in which the others are
+// judged again.
+//
+// What a request holds is judged by these rules, which the tests state as
+// they use them:
+//
+//     MRU 1          below 64 is Nak'd with 1500
+//     ACCM 2         any value
+//     Auth 3         PAP (C023) or CHAP with algorithm 5 (C223 05), only if
+//                    the session has a name; another protocol is Nak'd with
+//                    CHAP-MD5; without a name the option is Rejected
+//     Magic 5        a number equal to this end's is Nak'd with another
+//     PFC 7, ACFC 8  length 2
+//     anything else  Rejected, as is an option with the wrong length
+
+use std.list
+use std.test
+use pppframe
+use pppsess
+
+// A control packet from a code, an identifier and the data.
+fn pkt(code: Int, id: Int, data: [Int]) -> [Int]
+    let n = 4 + list.len(data)
+    list.concat([code, id, n >> 8, n & 255], data)
+
+// The frame the peer sends for a protocol and an information field.
+fn to_wire(proto: Int, info: [Int]) -> [Int]
+    var p: pppframe.PppInfo = Vec.new()
+    for x in info
+        let _ = p.push(x as u8)
+    var w: pppframe.PppWire = Vec.new()
+    let _ = pppframe.frame_encode(proto, var p, pppframe.opts_default(), var w)
+    var out: [Int] = []
+    for i in 0..w.len()
+        list.push(out, w[i] as Int)
+    out
+
+// The peer sends a frame; answer the events.
+fn peer(var s: pppsess.PppSession, proto: Int, info: [Int]) -> Int
+    var ev = 0
+    for b in to_wire(proto, info)
+        ev = ev | pppsess.sess_rx_byte(var s, b)
+    ev
+
+// The peer sends an LCP packet.
+fn lcp(var s: pppsess.PppSession, info: [Int]) -> Int
+    peer(var s, 0xC021, info)
+
+// Every frame the session has to send, each as [protocol, information...].
+fn pull(var s: pppsess.PppSession) -> [[Int]]
+    var out: [[Int]] = []
+    for _i in 0..12
+        var w: pppframe.PppWire = Vec.new()
+        if pppsess.sess_tx(var s, var w)
+            var rx = pppframe.rx_new()
+            pppframe.rx_set_accm(var rx, 0)
+            for j in 0..w.len()
+                if pppframe.rx_byte(var rx, w[j] as Int) == pppframe.PPP_RX_FRAME
+                    var one: [Int] = [rx.proto]
+                    for k in 0..rx.buf.len()
+                        list.push(one, rx.buf[k] as Int)
+                    list.push(out, one)
+    out
+
+// The options a layer is asking for, as a list.
+fn want_list(var s: pppsess.PppSession, l: Int) -> [Int]
+    var out: [Int] = []
+    for i in 0..s.want[l].len()
+        list.push(out, s.want[l][i] as Int)
+    out
+
+// A session with a name, a magic number and nothing else set.
+fn client() -> pppsess.PppSession
+    var s = pppsess.sess_new()
+    pppsess.sess_set_credentials(var s, "user", "pw")
+    pppsess.sess_set_magic(var s, 0x11111111)
+    s
+
+// Start, send the first request, take the peer's request `opts` and the
+// peer's acknowledgement of ours.  Answers the events of the last step.
+fn open_lcp(var s: pppsess.PppSession, opts: [Int]) -> Int
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 1, opts))
+    let _ = pull(var s)
+    lcp(var s, pkt(2, s.fsm[0].id, want_list(var s, 0)))
+
+// The data of a reply: the information without the protocol, code,
+// identifier and length.
+fn data_of(frame: [Int]) -> [Int]
+    list.slice(frame, 5, list.len(frame))
+
+// The options of the peer's request that the tests reuse.
+fn mru1500() -> [Int]
+    [0x01, 0x04, 0x05, 0xDC]
+
+// ── What is asked of this end ──────────────────────────────────────
+
+@test
+fn test_a_good_request_is_acknowledged_verbatim() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let opts = list.concat(mru1500(), [0x05, 0x06, 0x12, 0x34, 0x56, 0x78])
+    test.assert_eq(lcp(var s, pkt(1, 9, opts)), 0)
+    let out = pull(var s)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(2, 9, opts)))
+    test.assert_eq(s.fsm[0].state, 8)
+    test.assert_eq(s.peer_magic, 0x12345678)
+
+@test
+fn test_an_mru_below_64_is_nakd_with_1500() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 2, [0x01, 0x04, 0x00, 0x40, 0x01, 0x04, 0x00, 0x3F]))
+    let out = pull(var s)
+    // Both options are judged: 64 is fine and is not in the Nak; 63 is.
+    test.assert_eq(out[0], list.concat([0xC021], pkt(3, 2, [0x01, 0x04, 0x05, 0xDC])))
+    test.assert_eq(s.fsm[0].state, 6)
+
+@test
+fn test_an_mru_of_the_wrong_length_is_rejected() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 2, [0x01, 0x03, 0x05]))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(4, 2, [0x01, 0x03, 0x05])))
+
+@test
+fn test_accm_pfc_and_acfc_are_checked_for_length() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 3, [0x02, 0x04, 0x00, 0x00, 0x07, 0x03, 0x00, 0x08, 0x03, 0x00]))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(4, 3, [0x02, 0x04, 0x00, 0x00, 0x07, 0x03, 0x00, 0x08, 0x03, 0x00])))
+
+@test
+fn test_auth_with_pap_or_chap_md5_is_acknowledged() [io]
+    for opt in [[0x03, 0x04, 0xC0, 0x23], [0x03, 0x05, 0xC2, 0x23, 0x05]]
+        var s = client()
+        let _ = pppsess.sess_start(var s)
+        let _ = pull(var s)
+        let _ = lcp(var s, pkt(1, 4, opt))
+        let out = pull(var s)
+        test.assert_eq(out[0], list.concat([0xC021], pkt(2, 4, opt)))
+
+@test
+fn test_other_auth_is_nakd_with_chap_md5() [io]
+    // CHAP with algorithm 0x80 (MS-CHAP), PAP with a spurious byte, and a
+    // protocol this end has never heard of.
+    for opt in [[0x03, 0x05, 0xC2, 0x23, 0x80], [0x03, 0x05, 0xC0, 0x23, 0x00], [0x03, 0x04, 0xC2, 0x27]]
+        var s = client()
+        let _ = pppsess.sess_start(var s)
+        let _ = pull(var s)
+        let _ = lcp(var s, pkt(1, 5, opt))
+        let out = pull(var s)
+        test.assert_eq(out[0], list.concat([0xC021], pkt(3, 5, [0x03, 0x05, 0xC2, 0x23, 0x05])))
+
+@test
+fn test_auth_without_a_name_is_rejected() [io]
+    var s = pppsess.sess_new()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 6, [0x03, 0x05, 0xC2, 0x23, 0x05]))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(4, 6, [0x03, 0x05, 0xC2, 0x23, 0x05])))
+
+@test
+fn test_an_auth_option_that_is_too_short_is_rejected() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 6, [0x03, 0x03, 0xC0]))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(4, 6, [0x03, 0x03, 0xC0])))
+
+@test
+fn test_a_magic_number_equal_to_ours_is_nakd_with_another() [io]
+    // The loop-back check of RFC 1661 section 6.4.  The suggestion is our
+    // number exclusive-or 5A5A5A5A: 11111111 becomes 4B4B4B4B.
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 7, [0x05, 0x06, 0x11, 0x11, 0x11, 0x11]))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(3, 7, [0x05, 0x06, 0x4B, 0x4B, 0x4B, 0x4B])))
+
+@test
+fn test_a_magic_number_that_differs_is_acknowledged() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 7, [0x05, 0x06, 0x11, 0x11, 0x11, 0x12]))
+    let out = pull(var s)
+    test.assert_eq(out[0][1], 2)
+
+@test
+fn test_a_zero_magic_number_in_ours_is_not_a_loop() [io]
+    var s = pppsess.sess_new()
+    pppsess.sess_set_credentials(var s, "user", "pw")
+    pppsess.sess_set_magic(var s, 0)
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 7, [0x05, 0x06, 0x00, 0x00, 0x00, 0x00]))
+    let out = pull(var s)
+    test.assert_eq(out[0][1], 2)
+
+@test
+fn test_a_magic_option_of_the_wrong_length_is_rejected() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 8, [0x05, 0x04, 0x11, 0x11]))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(4, 8, [0x05, 0x04, 0x11, 0x11])))
+
+@test
+fn test_an_unknown_option_is_rejected_and_alone_in_the_reject() [io]
+    // The link quality protocol (4) is rejected; the MRU of 10 would be
+    // Nak'd, but a Reject goes first and carries only the rejected option.
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 9, [0x01, 0x04, 0x00, 0x0A, 0x04, 0x06, 0xC0, 0x25, 0x00, 0x00]))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(4, 9, [0x04, 0x06, 0xC0, 0x25, 0x00, 0x00])))
+
+@test
+fn test_after_five_naks_the_options_are_rejected_instead() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    for i in 0..5
+        let _ = lcp(var s, pkt(1, 10 + i, [0x01, 0x04, 0x00, 0x0A]))
+        let out = pull(var s)
+        test.case("nak ${i}")
+        test.assert_eq(out[0][1], 3)
+    let _ = lcp(var s, pkt(1, 20, [0x01, 0x04, 0x00, 0x0A]))
+    let sixth = pull(var s)
+    test.assert_eq(sixth[0], list.concat([0xC021], pkt(4, 20, [0x01, 0x04, 0x00, 0x0A])))
+
+@test
+fn test_an_acknowledged_request_resets_the_nak_count() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    for i in 0..4
+        let _ = lcp(var s, pkt(1, 10 + i, [0x01, 0x04, 0x00, 0x0A]))
+        let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 30, mru1500()))
+    test.assert_eq(pull(var s)[0][1], 2)
+    for i in 0..5
+        let _ = lcp(var s, pkt(1, 40 + i, [0x01, 0x04, 0x00, 0x0A]))
+        test.assert_eq(pull(var s)[0][1], 3)
+
+@test
+fn test_a_request_with_a_bad_option_is_not_answered() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, pkt(1, 3, [0x07, 0x01, 0x07, 0x02])), 0)
+    test.assert_eq(pull(var s), [])
+    test.assert_eq(s.fsm[0].state, 6)
+
+@test
+fn test_a_request_with_too_many_options_is_not_answered() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    var many: [Int] = []
+    for _i in 0..70
+        list.push(many, 0x07)
+        list.push(many, 0x02)
+    test.assert_eq(lcp(var s, pkt(1, 3, many)), 0)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_a_request_with_no_options_is_acknowledged() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 3, []))
+    test.assert_eq(pull(var s)[0], list.concat([0xC021], pkt(2, 3, [])))
+    test.assert_eq(s.peer_mru, 1500)
+    test.assert_eq(s.peer_accm, 0xFFFFFFFF)
+    test.assert_eq(s.peer_auth, 0)
+    test.assert_eq(s.peer_magic, 0)
+
+@test
+fn test_the_peers_values_are_taken_when_the_link_opens() [io]
+    var s = client()
+    let opts = [0x01, 0x04, 0x02, 0x00, 0x02, 0x06, 0x00, 0x0A, 0x00, 0x00, 0x07, 0x02, 0x08, 0x02]
+    test.assert_eq(open_lcp(var s, opts), pppsess.PPP_EV_LINK_UP)
+    test.assert_eq(s.tx_mru, 512)
+    test.assert_eq(s.tx_accm, 0x000A0000)
+    test.assert_eq(s.tx_pfc, true)
+    test.assert_eq(s.tx_acfc, true)
+    test.assert_eq(s.phase, pppsess.PPP_PH_NETWORK)
+
+@test
+fn test_a_link_with_no_auth_goes_straight_to_the_network_phase() [io]
+    var s = client()
+    test.assert_eq(open_lcp(var s, mru1500()), pppsess.PPP_EV_LINK_UP)
+    test.assert_eq(s.phase, pppsess.PPP_PH_NETWORK)
+    let out = pull(var s)
+    test.assert_eq(out[0][0], 0x8021)
+
+// ── What this end asks ─────────────────────────────────────────────
+
+@test
+fn test_the_first_request_holds_the_options_of_the_configuration() [io]
+    var s = pppsess.sess_new()
+    pppsess.sess_set_magic(var s, 0xCF2759C0)
+    pppsess.sess_set_accm(var s, 0x000A0000)
+    pppsess.sess_set_compression(var s, true, false)
+    let _ = pppsess.sess_start(var s)
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(1, 1, [0x02, 0x06, 0x00, 0x0A, 0x00, 0x00, 0x05, 0x06, 0xCF, 0x27, 0x59, 0xC0, 0x07, 0x02])))
+
+@test
+fn test_the_default_accm_and_no_magic_are_left_out() [io]
+    var s = pppsess.sess_new()
+    pppsess.sess_set_magic(var s, 0)
+    pppsess.sess_set_accm(var s, 0xFFFFFFFF)
+    let _ = pppsess.sess_start(var s)
+    test.assert_eq(pull(var s)[0], list.concat([0xC021], pkt(1, 1, [])))
+
+@test
+fn test_the_acfc_option_is_asked_for_when_set() [io]
+    var s = pppsess.sess_new()
+    pppsess.sess_set_magic(var s, 0)
+    pppsess.sess_set_accm(var s, 0xFFFFFFFF)
+    pppsess.sess_set_compression(var s, false, true)
+    let _ = pppsess.sess_start(var s)
+    test.assert_eq(pull(var s)[0], list.concat([0xC021], pkt(1, 1, [0x08, 0x02])))
+
+@test
+fn test_the_configure_ack_opens_with_the_requests_own_options() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 1, []))
+    let _ = pull(var s)
+    // An Ack with other options, and one with another identifier, are not
+    // ours.
+    test.assert_eq(lcp(var s, pkt(2, 1, [0x07, 0x02])), 0)
+    test.assert_eq(lcp(var s, pkt(2, 77, want_list(var s, 0))), 0)
+    test.assert_eq(s.fsm[0].state, 8)
+    test.assert_eq(lcp(var s, pkt(2, 1, want_list(var s, 0))), pppsess.PPP_EV_LINK_UP)
+
+@test
+fn test_a_nak_changes_the_request_and_the_identifier() [io]
+    var s = pppsess.sess_new()
+    pppsess.sess_set_magic(var s, 0x11111111)
+    pppsess.sess_set_accm(var s, 0)
+    let _ = pppsess.sess_start(var s)
+    let first = pull(var s)
+    test.assert_eq(first[0][2], 1)
+    // The peer wants an ACCM of 000A0000 and a different magic number, and
+    // suggests an option that was never asked for.
+    let nak = [0x02, 0x06, 0x00, 0x0A, 0x00, 0x00, 0x05, 0x06, 0x22, 0x22, 0x22, 0x22, 0x09, 0x04, 0x00, 0x00]
+    test.assert_eq(lcp(var s, pkt(3, 1, nak)), 0)
+    let second = pull(var s)
+    test.assert_eq(second[0], list.concat([0xC021], pkt(1, 2, [0x02, 0x06, 0x00, 0x0A, 0x00, 0x00, 0x05, 0x06, 0x22, 0x22, 0x22, 0x22])))
+    test.assert_eq(s.cfg_magic, 0x22222222)
+
+@test
+fn test_a_nak_of_the_wrong_identifier_is_ignored() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, pkt(3, 99, [0x02, 0x06, 0x00, 0x0A, 0x00, 0x00])), 0)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_a_reject_removes_the_option_from_the_next_request() [io]
+    var s = pppsess.sess_new()
+    pppsess.sess_set_magic(var s, 0x11111111)
+    pppsess.sess_set_accm(var s, 0)
+    pppsess.sess_set_compression(var s, true, true)
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, pkt(4, 1, [0x07, 0x02, 0x08, 0x02])), 0)
+    let again = pull(var s)
+    test.assert_eq(again[0], list.concat([0xC021], pkt(1, 2, [0x02, 0x06, 0x00, 0x00, 0x00, 0x00, 0x05, 0x06, 0x11, 0x11, 0x11, 0x11])))
+
+@test
+fn test_a_reject_of_what_was_not_sent_is_ignored() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let before = want_list(var s, 0)
+    // PFC was never asked for; an option cut short is not a reject either.
+    test.assert_eq(lcp(var s, pkt(4, 1, [0x07, 0x02])), 0)
+    test.assert_eq(lcp(var s, pkt(4, 1, [0x05, 0x06, 0x99, 0x99, 0x99, 0x99])), 0)
+    test.assert_eq(lcp(var s, pkt(4, 1, [0x07])), 0)
+    test.assert_eq(want_list(var s, 0), before)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_a_reject_with_the_wrong_identifier_is_ignored() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, pkt(4, 55, [0x05, 0x06, 0x11, 0x11, 0x11, 0x11])), 0)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_a_peer_that_keeps_naking_is_given_up_on() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    var ev = 0
+    for _i in 0..11
+        ev = ev | lcp(var s, pkt(3, s.fsm[0].id, [0x02, 0x06, 0x00, 0x00, 0x00, 0x01]))
+        let _ = pull(var s)
+    test.assert_eq(ev & pppsess.PPP_EV_CLOSED, pppsess.PPP_EV_CLOSED)
+    test.assert_eq(s.phase, pppsess.PPP_PH_DEAD)
+    test.assert_eq(s.fsm[0].state, 3)
+
+// ── Time ───────────────────────────────────────────────────────────
+
+@test
+fn test_a_silent_peer_gets_the_same_request_again_and_then_the_link_is_given_up() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let first = pull(var s)
+    var sent = 1
+    var ev = 0
+    for _i in 0..12
+        ev = ev | pppsess.sess_tick(var s, 3000)
+        let out = pull(var s)
+        if list.len(out) > 0
+            sent = sent + 1
+            // The identifier and the options are the first request's.
+            test.assert_eq(out[0], first[0])
+    test.assert_eq(sent, 10)
+    test.assert_eq(ev, pppsess.PPP_EV_CLOSED)
+    test.assert_eq(s.phase, pppsess.PPP_PH_DEAD)
+
+@test
+fn test_a_tick_before_the_interval_sends_nothing() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(pppsess.sess_tick(var s, 2999), 0)
+    test.assert_eq(pull(var s), [])
+    test.assert_eq(pppsess.sess_tick(var s, 1), 0)
+    test.assert_eq(list.len(pull(var s)), 1)
+
+// ── Keeping the link, and ending it ────────────────────────────────
+
+@test
+fn test_an_echo_request_is_answered_only_when_the_link_is_open() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    // Not open: Req-Sent ignores an Echo-Request.
+    test.assert_eq(lcp(var s, pkt(9, 4, [0, 0, 0, 1])), 0)
+    test.assert_eq(pull(var s), [])
+    let _ = lcp(var s, pkt(1, 1, []))
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(2, s.fsm[0].id, want_list(var s, 0)))
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, pkt(9, 4, [0, 0, 0, 1, 0xAA, 0xBB])), 0)
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(10, 4, [0x11, 0x11, 0x11, 0x11, 0xAA, 0xBB])))
+
+@test
+fn test_our_echo_request_carries_our_magic_and_replies_are_counted() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    pppsess.sess_echo(var s)
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(9, 2, [0x11, 0x11, 0x11, 0x11])))
+    test.assert_eq(s.echoes_sent, 1)
+    test.assert_eq(lcp(var s, pkt(10, 2, [0, 0, 0, 1])), 0)
+    test.assert_eq(s.echoes_recv, 1)
+    // A Discard-Request is taken and nothing comes back.
+    test.assert_eq(lcp(var s, pkt(11, 3, [1, 2, 3])), 0)
+    test.assert_eq(pull(var s), [])
+    pppsess.sess_echo(var s)
+    let again = pull(var s)
+    test.assert_eq(again[0][2], 3)
+
+@test
+fn test_a_terminate_request_is_acknowledged_and_takes_the_link_down() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let ev = lcp(var s, pkt(5, 6, []))
+    test.assert_eq(ev & pppsess.PPP_EV_LINK_DOWN, pppsess.PPP_EV_LINK_DOWN)
+    test.assert_eq(pull(var s)[0], list.concat([0xC021], pkt(6, 6, [])))
+    test.assert_eq(s.phase, pppsess.PPP_PH_TERMINATE)
+    // The restart timer ends the wait.
+    let done = pppsess.sess_tick(var s, 3000)
+    test.assert_eq(done, pppsess.PPP_EV_CLOSED)
+    test.assert_eq(s.phase, pppsess.PPP_PH_DEAD)
+
+@test
+fn test_closing_sends_terminate_requests_until_answered_or_given_up() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let _ = pppsess.sess_close(var s)
+    let first = pull(var s)
+    test.assert_eq(first[0][1], 5)
+    var more = 0
+    var ev = 0
+    for _i in 0..6
+        ev = ev | pppsess.sess_tick(var s, 3000)
+        more = more + list.len(pull(var s))
+    test.assert_eq(more, 1)
+    test.assert_eq(ev, pppsess.PPP_EV_CLOSED)
+
+@test
+fn test_closing_a_link_that_never_opened_drops_the_pending_request() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pppsess.sess_close(var s)
+    let out = pull(var s)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0][1], 5)
+
+@test
+fn test_a_terminate_ack_closes_a_closing_link() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pppsess.sess_close(var s)
+    let out = pull(var s)
+    test.assert_eq(lcp(var s, pkt(6, out[0][2], [])), pppsess.PPP_EV_CLOSED)
+
+@test
+fn test_carrier_loss_takes_the_link_down_and_it_can_start_again() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let ev = pppsess.sess_lower_down(var s)
+    test.assert_eq(ev & pppsess.PPP_EV_LINK_DOWN, pppsess.PPP_EV_LINK_DOWN)
+    test.assert_eq(s.phase, pppsess.PPP_PH_DEAD)
+    test.assert_eq(s.fsm[0].state, 1)
+    test.assert_eq(pull(var s), [])
+    // The state is the defaults again.
+    test.assert_eq(s.tx_accm, 0xFFFFFFFF)
+    test.assert_eq(s.tx_mru, 1500)
+    let _ = pppsess.sess_start(var s)
+    test.assert_eq(pull(var s)[0][1], 1)
+
+@test
+fn test_frames_before_start_are_ignored() [io]
+    var s = client()
+    test.assert_eq(lcp(var s, pkt(1, 1, [])), 0)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_a_frame_error_is_reported() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    var w = to_wire(0xC021, pkt(1, 1, []))
+    w[5] = 0x55
+    var ev = 0
+    for b in w
+        ev = ev | pppsess.sess_rx_byte(var s, b)
+    test.assert_eq(ev, pppsess.PPP_EV_FRAME_ERROR)
+
+@test
+fn test_a_packet_that_is_not_well_formed_is_dropped() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, [0x01, 0x01, 0x00]), 0)
+    test.assert_eq(lcp(var s, [0x01, 0x01, 0x00, 0x20]), 0)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_start_twice_leaves_a_running_link_alone() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    test.assert_eq(pppsess.sess_start(var s), 0)
+    let out = pull(var s)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(s.fsm[0].state, 6)
+
+// ── Codes and protocols this end does not run ──────────────────────
+
+@test
+fn test_an_unknown_code_is_answered_with_a_code_reject() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let bad = pkt(99, 12, [0xAB, 0xCD])
+    test.assert_eq(lcp(var s, bad), 0)
+    let out = pull(var s)
+    test.assert_eq(out[0][1], 7)
+    test.assert_eq(data_of(out[0]), bad)
+
+@test
+fn test_a_long_unknown_packet_is_cut_in_the_code_reject() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    var data: [Int] = []
+    for _i in 0..300
+        list.push(data, 0x41)
+    test.assert_eq(lcp(var s, pkt(99, 12, data)), 0)
+    let out = pull(var s)
+    test.assert_eq(list.len(data_of(out[0])), 128)
+
+@test
+fn test_a_code_reject_of_a_negotiation_code_is_fatal() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let ev = lcp(var s, pkt(7, 3, pkt(1, 1, [])))
+    test.assert_eq(ev & pppsess.PPP_EV_LINK_DOWN, pppsess.PPP_EV_LINK_DOWN)
+    test.assert_eq(s.fsm[0].state, 5)
+
+@test
+fn test_a_code_reject_of_an_extension_is_taken_calmly() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, pkt(7, 3, pkt(9, 1, []))), 0)
+    test.assert_eq(s.fsm[0].state, 9)
+
+@test
+fn test_an_unknown_protocol_is_answered_with_a_protocol_reject() [io]
+    // CCP, 0x80FD: the way this end declines compression.
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let ccp = [0x01, 0x01, 0x00, 0x04]
+    test.assert_eq(peer(var s, 0x80FD, ccp), 0)
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0xC021], pkt(8, 2, list.concat([0x80, 0xFD], ccp))))
+
+@test
+fn test_a_long_unknown_protocol_is_cut_in_the_protocol_reject() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    var data: [Int] = []
+    for _i in 0..300
+        list.push(data, 0x41)
+    test.assert_eq(peer(var s, 0x003D, data), 0)
+    test.assert_eq(list.len(data_of(pull(var s)[0])), 2 + 120)
+
+@test
+fn test_an_unknown_protocol_before_the_link_is_open_is_dropped() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(peer(var s, 0x80FD, [1, 1, 0, 4]), 0)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_a_protocol_reject_of_lcp_is_fatal() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let ev = lcp(var s, pkt(8, 3, [0xC0, 0x21]))
+    test.assert_eq(ev & pppsess.PPP_EV_LINK_DOWN, pppsess.PPP_EV_LINK_DOWN)
+
+@test
+fn test_a_protocol_reject_of_an_unused_protocol_is_taken_calmly() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    test.assert_eq(lcp(var s, pkt(8, 3, [0x80, 0xFD])), 0)
+    test.assert_eq(s.fsm[0].state, 9)
+
+@test
+fn test_a_protocol_reject_of_ipcp_ends_ipcp_and_not_the_link() [io]
+    var s = client()
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let ev = lcp(var s, pkt(8, 3, [0x80, 0x21]))
+    test.assert_eq(ev & pppsess.PPP_EV_NCP_FAILED, pppsess.PPP_EV_NCP_FAILED)
+    test.assert_eq(s.fsm[0].state, 9)
+    test.assert_eq(s.fsm[1].state, 3)
+
+@test
+fn test_a_protocol_reject_of_ipv6cp_ends_ipv6cp() [io]
+    var s = client()
+    pppsess.sess_set_ipv6(var s, true, 0, 1)
+    let _ = open_lcp(var s, mru1500())
+    let _ = pull(var s)
+    let ev = lcp(var s, pkt(8, 3, [0x80, 0x57]))
+    test.assert_eq(ev & pppsess.PPP_EV_NCP_FAILED, pppsess.PPP_EV_NCP_FAILED)
+    test.assert_eq(s.fsm[2].state, 3)
+
+@test
+fn test_a_protocol_reject_of_the_authentication_protocols_is_fatal() [io]
+    for proto in [[0xC0, 0x23], [0xC2, 0x23]]
+        var s = client()
+        let _ = open_lcp(var s, mru1500())
+        let _ = pull(var s)
+        let ev = lcp(var s, pkt(8, 3, proto))
+        test.assert_eq(ev & pppsess.PPP_EV_LINK_DOWN, pppsess.PPP_EV_LINK_DOWN)
+
+// ── The reply that was not taken ───────────────────────────────────
+
+@test
+fn test_a_reply_not_taken_is_replaced_and_counted() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 1, []))
+    let _ = lcp(var s, pkt(1, 2, []))
+    test.assert_eq(s.tx_lost, 1)
+    let out = pull(var s)
+    test.assert_eq(list.len(out), 1)
+    test.assert_eq(out[0][2], 2)
+
+@test
+fn test_a_reply_that_does_not_fit_stays_until_it_does() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = lcp(var s, pkt(1, 1, []))
+    var full: pppframe.PppWire = Vec.new()
+    for _i in 0..pppframe.PPP_WIRE_MAX
+        let _ = full.push(0x55)
+    test.assert_eq(pppsess.sess_tx(var s, var full), false)
+    test.assert_eq(s.out_pending, true)
+    test.assert_eq(list.len(pull(var s)), 1)
+
+@test
+fn test_a_request_that_does_not_fit_stays_queued() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    var full: pppframe.PppWire = Vec.new()
+    for _i in 0..pppframe.PPP_WIRE_MAX
+        let _ = full.push(0x55)
+    test.assert_eq(pppsess.sess_tx(var s, var full), false)
+    test.assert_eq(list.len(pull(var s)), 1)
+    // A pending echo as well.
+    pppsess.sess_echo(var s)
+    test.assert_eq(pppsess.sess_tx(var s, var full), false)
+    test.assert_eq(s.echoes_sent, 0)
+
+@test
+fn test_nothing_to_send_answers_false() [io]
+    var s = client()
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppsess.sess_tx(var s, var w), false)
+    test.assert_eq(w.len(), 0)
+
+// ── Sending a datagram ─────────────────────────────────────────────
+
+@test
+fn test_a_datagram_is_refused_before_the_network_layer_is_open() [io]
+    var s = client()
+    var d: pppframe.PppInfo = Vec.new()
+    let _ = d.push(0x45)
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IP, var d, var w), false)
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IPV6, var d, var w), false)
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_LCP, var d, var w), false)
+    test.assert_eq(w.len(), 0)

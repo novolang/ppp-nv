@@ -669,7 +669,7 @@ fn judge_request(var s: PppSession, l: Int) -> Int []
             let v = verdict_of(var s, l, pos)
             if code == PPP_CP_CONF_ACK
                 pppcp.copy_opt(var s.out, var s.rx.buf, pos)
-            elif code == PPP_CP_CONF_REJ and v != 0
+            elif code == PPP_CP_CONF_REJ and (v == 2 or (v == 1 and as_reject))
                 pppcp.copy_opt(var s.out, var s.rx.buf, pos)
             elif code == PPP_CP_CONF_NAK and v == 1
                 suggest(var s, l, pos)
@@ -1039,7 +1039,8 @@ fn build_pap_request(var s: PppSession) []
 
 // Start the link: the serial port is in data mode, the lower layer is up, and
 // this end asks to open.  Answers the events that caused; the Configure-Request
-// is queued for `sess_tx`.
+// is queued for `sess_tx`.  A link that is already negotiating or open is left
+// as it is.
 //
 // ```novo
 // use pppsess
@@ -1052,6 +1053,8 @@ fn build_pap_request(var s: PppSession) []
 pub @tier(embedded)
 @no_alloc
 fn sess_start(var s: PppSession) -> Int []
+    if s.fsm[PPP_L_LCP].state >= pppfsm.PPP_S_REQ_SENT
+        return 0
     build_wants(var s)
     reset_link(var s)
     s.pend = 0

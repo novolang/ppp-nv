@@ -406,19 +406,19 @@ fn test_a_runt_frame_is_reported() [io]
 @test
 fn test_a_wrong_control_is_a_bad_header() [io]
     var rx = pppframe.rx_new()
-    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x04, 0x00, 0x21, 0x45, 0x00, 0x00, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x7D, 0x24, 0x7D, 0x20, 0x21, 0x45, 0x55, 0x66, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
     test.assert_eq(rx.errors, 1)
 
 @test
 fn test_a_protocol_whose_second_byte_is_even_is_a_bad_header() [io]
     var rx = pppframe.rx_new()
-    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x03, 0x00, 0x20, 0x45, 0x00, 0x00, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x7D, 0x23, 0x7D, 0x20, 0x20, 0x45, 0x55, 0x66, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
 
 @test
 fn test_the_receiver_resynchronises_after_a_bad_header() [io]
     var rx = pppframe.rx_new()
     pppframe.rx_set_accm(var rx, 0xA0000)
-    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x04, 0x00, 0x21, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x7D, 0x24, 0x7D, 0x20, 0x21, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
     test.assert_eq(feed(var rx, v2()), pppframe.PPP_RX_FRAME)
 
 @test
@@ -531,3 +531,13 @@ fn test_random_frames_go_round_under_random_options() [io]
         test.assert_eq(feed(var rx, w), pppframe.PPP_RX_FRAME)
         test.assert_eq(rx.proto, proto)
         test.assert_eq(buf_list(var rx), xs)
+
+@test
+fn test_a_plain_byte_that_does_not_fit_ends_the_frame_unwritten() [io]
+    // No escapes at all: the frame is 8 bytes, and the wire has 4 free.
+    var w: pppframe.PppWire = Vec.new()
+    for _i in 0..(pppframe.PPP_WIRE_MAX - 4)
+        let _ = w.push(0x55)
+    var info = info_of([0x41, 0x42, 0x43])
+    test.assert_eq(pppframe.frame_encode(0x0021, var info, opts(0, true, true, false), var w), false)
+    test.assert_eq(w.len(), pppframe.PPP_WIRE_MAX - 4)

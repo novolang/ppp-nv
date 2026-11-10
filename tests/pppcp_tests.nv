@@ -1,0 +1,318 @@
+// pppcp_tests.nv — the control packet and the option lists.
+//
+// The packet is RFC 1661 section 5: code, identifier, a 16-bit length that
+// counts the four header bytes and the data, and the data.  A
+// Configure-Request for an MRU of 1500 (option 1, length 4, value 05DC) is
+// therefore
+//
+//     01 07 00 08 01 04 05 DC
+//
+// for identifier 7, eight bytes long.  The list of options is the data
+// alone, `01 04 05 DC`.  Every reader answers a fixed value outside the
+// packet, so the tests also ask about positions past the end and a length
+// that lies.
+
+use std.list
+use std.test
+use pppcp
+use pppframe
+
+// A packet from a list of byte values, the length field as given.
+fn packet_of(xs: [Int]) -> pppframe.PppInfo
+    var p: pppframe.PppInfo = Vec.new()
+    for x in xs
+        let _ = p.push(x as u8)
+    p
+
+// The bytes of a packet as a list.
+fn list_of(var p: pppframe.PppInfo) -> [Int]
+    var out: [Int] = []
+    for i in 0..p.len()
+        list.push(out, p[i] as Int)
+    out
+
+// The bytes of an option list as a list.
+fn opts_list(var o: pppcp.PppOpts) -> [Int]
+    var out: [Int] = []
+    for i in 0..o.len()
+        list.push(out, o[i] as Int)
+    out
+
+@test
+fn test_the_codes_are_those_of_rfc_1661() [io]
+    test.assert_eq(pppcp.PPP_CP_CONF_REQ, 1)
+    test.assert_eq(pppcp.PPP_CP_CONF_ACK, 2)
+    test.assert_eq(pppcp.PPP_CP_CONF_NAK, 3)
+    test.assert_eq(pppcp.PPP_CP_CONF_REJ, 4)
+    test.assert_eq(pppcp.PPP_CP_TERM_REQ, 5)
+    test.assert_eq(pppcp.PPP_CP_TERM_ACK, 6)
+    test.assert_eq(pppcp.PPP_CP_CODE_REJ, 7)
+    test.assert_eq(pppcp.PPP_CP_PROTO_REJ, 8)
+    test.assert_eq(pppcp.PPP_CP_ECHO_REQ, 9)
+    test.assert_eq(pppcp.PPP_CP_ECHO_REP, 10)
+    test.assert_eq(pppcp.PPP_CP_DISCARD_REQ, 11)
+
+@test
+fn test_a_packet_is_built_with_its_length() [io]
+    var p: pppframe.PppInfo = Vec.new()
+    pppcp.cp_begin(var p, 1, 7)
+    pppcp.cp_put8(var p, 1)
+    pppcp.cp_put8(var p, 4)
+    pppcp.cp_put16(var p, 1500)
+    pppcp.cp_end(var p)
+    test.assert_eq(list_of(var p), [0x01, 0x07, 0x00, 0x08, 0x01, 0x04, 0x05, 0xDC])
+    test.assert_eq(pppcp.cp_code(var p), 1)
+    test.assert_eq(pppcp.cp_id(var p), 7)
+    test.assert_eq(pppcp.cp_len(var p), 8)
+
+@test
+fn test_begin_empties_the_buffer() [io]
+    var p = packet_of([9, 9, 9, 9, 9, 9, 9, 9, 9])
+    pppcp.cp_begin(var p, 6, 1)
+    pppcp.cp_end(var p)
+    test.assert_eq(list_of(var p), [0x06, 0x01, 0x00, 0x04])
+
+@test
+fn test_a_32_bit_number_is_written_high_byte_first() [io]
+    var p: pppframe.PppInfo = Vec.new()
+    pppcp.cp_begin(var p, 1, 1)
+    pppcp.cp_put32(var p, 0xC0A80001)
+    test.assert_eq(list_of(var p), [0x01, 0x01, 0x00, 0x04, 0xC0, 0xA8, 0x00, 0x01])
+    test.assert_eq(pppcp.get32(var p, 4), 0xC0A80001)
+    test.assert_eq(pppcp.get16(var p, 4), 0xC0A8)
+    test.assert_eq(pppcp.get16(var p, 6), 0x0001)
+
+@test
+fn test_a_full_packet_takes_no_more() [io]
+    var p: pppframe.PppInfo = Vec.new()
+    for _i in 0..pppframe.PPP_BUF_MAX
+        pppcp.cp_put8(var p, 0x55)
+    test.assert_eq(p.len(), pppframe.PPP_BUF_MAX)
+    pppcp.cp_put8(var p, 0x66)
+    test.assert_eq(p.len(), pppframe.PPP_BUF_MAX)
+    test.assert_eq(p[pppframe.PPP_BUF_MAX - 1], 0x55)
+
+@test
+fn test_readers_answer_zero_outside_the_packet() [io]
+    var p = packet_of([0x01, 0x02, 0x00, 0x04])
+    test.assert_eq(pppcp.get8(var p, 4), 0)
+    test.assert_eq(pppcp.get8(var p, -1), 0)
+    test.assert_eq(pppcp.get8(var p, 3), 4)
+    test.assert_eq(pppcp.get16(var p, 3), 0x0400)
+    test.assert_eq(pppcp.get32(var p, 2), 0x00040000)
+
+@test
+fn test_a_packet_is_valid_when_its_length_fits() [io]
+    // Too short for a header.
+    var a = packet_of([0x01, 0x02, 0x00])
+    test.assert_eq(pppcp.cp_valid(var a), false)
+    // A declared length below 4.
+    var b = packet_of([0x01, 0x02, 0x00, 0x03])
+    test.assert_eq(pppcp.cp_valid(var b), false)
+    // A declared length past the bytes held.
+    var c = packet_of([0x01, 0x02, 0x00, 0x09, 0x00])
+    test.assert_eq(pppcp.cp_valid(var c), false)
+    // Exactly the bytes held.
+    var d = packet_of([0x01, 0x02, 0x00, 0x05, 0x00])
+    test.assert_eq(pppcp.cp_valid(var d), true)
+    // Padding after the declared length is allowed.
+    var e = packet_of([0x01, 0x02, 0x00, 0x04, 0xAA, 0xBB])
+    test.assert_eq(pppcp.cp_valid(var e), true)
+
+@test
+fn test_an_option_is_found_by_its_length() [io]
+    // MRU option at 4, then an option at 8 whose length runs past the end.
+    var p = packet_of([0x01, 0x01, 0x00, 0x0B, 0x01, 0x04, 0x05, 0xDC, 0x05, 0x06, 0x00])
+    test.assert_eq(pppcp.opt_len_at(var p, 4), 4)
+    // Length 6 from byte 8 passes the declared end at 11.
+    test.assert_eq(pppcp.opt_len_at(var p, 8), 0)
+    // Before the data, and past the end.
+    test.assert_eq(pppcp.opt_len_at(var p, 3), 0)
+    test.assert_eq(pppcp.opt_len_at(var p, 10), 0)
+    test.assert_eq(pppcp.opt_len_at(var p, 40), 0)
+
+@test
+fn test_an_option_of_length_below_two_is_not_an_option() [io]
+    var p = packet_of([0x01, 0x01, 0x00, 0x06, 0x07, 0x01])
+    test.assert_eq(pppcp.opt_len_at(var p, 4), 0)
+    var q = packet_of([0x01, 0x01, 0x00, 0x06, 0x07, 0x00])
+    test.assert_eq(pppcp.opt_len_at(var q, 4), 0)
+
+@test
+fn test_copy_opt_copies_one_whole_option() [io]
+    var src = packet_of([0x01, 0x01, 0x00, 0x0C, 0x07, 0x02, 0x01, 0x04, 0x05, 0xDC, 0x08, 0x02])
+    var dst: pppframe.PppInfo = Vec.new()
+    pppcp.cp_begin(var dst, 4, 1)
+    pppcp.copy_opt(var dst, var src, 6)
+    pppcp.cp_end(var dst)
+    test.assert_eq(list_of(var dst), [0x04, 0x01, 0x00, 0x08, 0x01, 0x04, 0x05, 0xDC])
+
+@test
+fn test_copy_opt_of_a_malformed_option_copies_nothing() [io]
+    var src = packet_of([0x01, 0x01, 0x00, 0x06, 0x07, 0x09])
+    var dst: pppframe.PppInfo = Vec.new()
+    pppcp.cp_begin(var dst, 4, 1)
+    pppcp.copy_opt(var dst, var src, 4)
+    test.assert_eq(dst.len(), 4)
+
+// ── The option lists ───────────────────────────────────────────────
+
+@test
+fn test_the_puts_write_the_options_of_rfc_1661() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put16(var o, 1, 1500)
+    pppcp.opts_put32(var o, 2, 0x000A0000)
+    pppcp.opts_put0(var o, 7)
+    pppcp.opts_put64(var o, 1, 0x02005EFF, 0xFE000001)
+    test.assert_eq(opts_list(var o),
+                   [0x01, 0x04, 0x05, 0xDC,
+                    0x02, 0x06, 0x00, 0x0A, 0x00, 0x00,
+                    0x07, 0x02,
+                    0x01, 0x0A, 0x02, 0x00, 0x5E, 0xFF, 0xFE, 0x00, 0x00, 0x01])
+
+@test
+fn test_a_full_list_takes_no_more_options() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    for _i in 0..32
+        pppcp.opts_put0(var o, 7)
+    test.assert_eq(o.len(), 64)
+    pppcp.opts_put0(var o, 8)
+    pppcp.opts_put16(var o, 1, 1500)
+    pppcp.opts_put32(var o, 2, 0)
+    pppcp.opts_put64(var o, 1, 0, 0)
+    test.assert_eq(o.len(), 64)
+
+@test
+fn test_an_option_that_just_fits_is_written() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    for _i in 0..30
+        pppcp.opts_put0(var o, 7)
+    // 60 bytes used; 4 free for a 16-bit option, not enough for 6 or 10.
+    pppcp.opts_put32(var o, 2, 0)
+    test.assert_eq(o.len(), 60)
+    pppcp.opts_put64(var o, 1, 0, 0)
+    test.assert_eq(o.len(), 60)
+    pppcp.opts_put16(var o, 1, 1500)
+    test.assert_eq(o.len(), 64)
+
+@test
+fn test_find_walks_over_the_options_before_it() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put16(var o, 1, 1500)
+    pppcp.opts_put0(var o, 7)
+    pppcp.opts_put32(var o, 5, 0x11223344)
+    test.assert_eq(pppcp.opts_find(var o, 1), 0)
+    test.assert_eq(pppcp.opts_find(var o, 7), 4)
+    test.assert_eq(pppcp.opts_find(var o, 5), 6)
+    test.assert_eq(pppcp.opts_find(var o, 8), -1)
+
+@test
+fn test_find_stops_at_a_list_that_does_not_parse() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    let _ = o.push(0x07)
+    let _ = o.push(0x00)
+    let _ = o.push(0x08)
+    let _ = o.push(0x02)
+    test.assert_eq(pppcp.opts_find(var o, 8), -1)
+    test.assert_eq(pppcp.opts_find(var o, 7), 0)
+
+@test
+fn test_the_getters_read_values_or_answer_what_was_asked() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put16(var o, 1, 1500)
+    pppcp.opts_put32(var o, 2, 0x000A0000)
+    pppcp.opts_put64(var o, 9, 0x01020304, 0x05060708)
+    test.assert_eq(pppcp.opts_get16(var o, 1, -1), 1500)
+    test.assert_eq(pppcp.opts_get32(var o, 2, 0, -1), 0x000A0000)
+    test.assert_eq(pppcp.opts_get32(var o, 9, 0, -1), 0x01020304)
+    test.assert_eq(pppcp.opts_get32(var o, 9, 4, -1), 0x05060708)
+    // Missing option.
+    test.assert_eq(pppcp.opts_get16(var o, 99, -5), -5)
+    test.assert_eq(pppcp.opts_get32(var o, 99, 0, -6), -6)
+    // A value too short for the read: the MRU has two bytes of value.
+    test.assert_eq(pppcp.opts_get32(var o, 1, 0, -7), -7)
+    test.assert_eq(pppcp.opts_get16(var o, 7, -8), -8)
+    // The 8-byte value read from byte 5 would run past it.
+    test.assert_eq(pppcp.opts_get32(var o, 9, 5, -9), -9)
+
+@test
+fn test_get16_of_a_one_byte_option_is_missing() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put0(var o, 7)
+    test.assert_eq(pppcp.opts_get16(var o, 7, -1), -1)
+
+@test
+fn test_remove_takes_out_one_option_and_keeps_the_rest() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put16(var o, 1, 1500)
+    pppcp.opts_put0(var o, 7)
+    pppcp.opts_put0(var o, 8)
+    pppcp.opts_remove(var o, 7)
+    test.assert_eq(opts_list(var o), [0x01, 0x04, 0x05, 0xDC, 0x08, 0x02])
+    pppcp.opts_remove(var o, 1)
+    test.assert_eq(opts_list(var o), [0x08, 0x02])
+    // An option that is not there leaves the list alone.
+    pppcp.opts_remove(var o, 99)
+    test.assert_eq(opts_list(var o), [0x08, 0x02])
+
+@test
+fn test_adopt_overwrites_a_value_of_the_same_length() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put32(var o, 3, 0)
+    var p = packet_of([0x03, 0x01, 0x00, 0x0A, 0x03, 0x06, 0x0A, 0x00, 0x00, 0x05])
+    test.assert_eq(pppcp.opts_adopt(var o, 3, var p, 4), true)
+    test.assert_eq(pppcp.opts_get32(var o, 3, 0, -1), 0x0A000005)
+
+@test
+fn test_adopt_refuses_what_it_cannot_take() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put32(var o, 3, 0)
+    // No such option in the list.
+    var p = packet_of([0x03, 0x01, 0x00, 0x0A, 0x04, 0x06, 0x0A, 0x00, 0x00, 0x05])
+    test.assert_eq(pppcp.opts_adopt(var o, 4, var p, 4), false)
+    // A different length: the list's option is 6 bytes, the packet's is 4.
+    var q = packet_of([0x03, 0x01, 0x00, 0x08, 0x03, 0x04, 0x0A, 0x00])
+    test.assert_eq(pppcp.opts_adopt(var o, 3, var q, 4), false)
+    // A malformed option in the packet.
+    var r = packet_of([0x03, 0x01, 0x00, 0x06, 0x03, 0x01])
+    test.assert_eq(pppcp.opts_adopt(var o, 3, var r, 4), false)
+    test.assert_eq(pppcp.opts_get32(var o, 3, 0, -1), 0)
+
+@test
+fn test_has_compares_an_option_byte_for_byte() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put32(var o, 3, 0x0A000001)
+    var same = packet_of([0x04, 0x01, 0x00, 0x0A, 0x03, 0x06, 0x0A, 0x00, 0x00, 0x01])
+    test.assert_eq(pppcp.opts_has(var o, var same, 4), true)
+    var other = packet_of([0x04, 0x01, 0x00, 0x0A, 0x03, 0x06, 0x0A, 0x00, 0x00, 0x02])
+    test.assert_eq(pppcp.opts_has(var o, var other, 4), false)
+    var absent = packet_of([0x04, 0x01, 0x00, 0x06, 0x07, 0x02])
+    test.assert_eq(pppcp.opts_has(var o, var absent, 4), false)
+    var shorter = packet_of([0x04, 0x01, 0x00, 0x08, 0x03, 0x04, 0x0A, 0x00])
+    test.assert_eq(pppcp.opts_has(var o, var shorter, 4), false)
+    var bad = packet_of([0x04, 0x01, 0x00, 0x05, 0x03])
+    test.assert_eq(pppcp.opts_has(var o, var bad, 4), false)
+
+@test
+fn test_equal_compares_the_whole_data() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put16(var o, 1, 1500)
+    var good = packet_of([0x02, 0x01, 0x00, 0x08, 0x01, 0x04, 0x05, 0xDC])
+    test.assert_eq(pppcp.opts_equal(var o, var good), true)
+    var differs = packet_of([0x02, 0x01, 0x00, 0x08, 0x01, 0x04, 0x05, 0xDD])
+    test.assert_eq(pppcp.opts_equal(var o, var differs), false)
+    var longer = packet_of([0x02, 0x01, 0x00, 0x0A, 0x01, 0x04, 0x05, 0xDC, 0x07, 0x02])
+    test.assert_eq(pppcp.opts_equal(var o, var longer), false)
+    var empty = packet_of([0x02, 0x01, 0x00, 0x04])
+    test.assert_eq(pppcp.opts_equal(var o, var empty), false)
+
+@test
+fn test_a_list_becomes_a_packet() [io]
+    var o: pppcp.PppOpts = Vec.new()
+    pppcp.opts_put32(var o, 5, 0x11223344)
+    var p: pppframe.PppInfo = Vec.new()
+    pppcp.opts_packet(var o, var p, 1, 9)
+    test.assert_eq(list_of(var p), [0x01, 0x09, 0x00, 0x0A, 0x05, 0x06, 0x11, 0x22, 0x33, 0x44])
+    var e: pppcp.PppOpts = Vec.new()
+    pppcp.opts_packet(var e, var p, 2, 3)
+    test.assert_eq(list_of(var p), [0x02, 0x03, 0x00, 0x04])
