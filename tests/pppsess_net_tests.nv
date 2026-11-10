@@ -1,0 +1,559 @@
+// pppsess_net_tests.nv — authentication, IPCP, IPv6CP and the datagrams.
+//
+// PAP (RFC 1334) is one request and one answer.  The Authenticate-Request is
+// code 1 with the peer-id as a length byte and the bytes, then the password
+// the same way:
+//
+//     01 01 00 0F | 04 "user" | 02 "pw"
+//
+// (identifier 1, length 4 + 5 + 3 = 12 = 0x0C; the tests write the numbers
+// out).  The answer is code 2 (Ack) or 3 (Nak) with the same identifier and a
+// message.  CHAP (RFC 1994) is a Challenge (code 1: identifier, a value size,
+// the value, a name), a Response (code 2) and a Success (3) or Failure (4).
+//
+// IPCP (RFC 1332) option 3 is the IP-Address, six bytes; RFC 1877's options
+// 129 and 131 are the primary and secondary DNS addresses.  IPv6CP (RFC 5072)
+// option 1 is the Interface-Identifier, ten bytes.  The tests name the
+// addresses they use with the documentation ranges where they can.
+
+use std.list
+use std.test
+use pppframe
+use pppsess
+
+// A control packet from a code, an identifier and the data.
+fn pkt(code: Int, id: Int, data: [Int]) -> [Int]
+    let n = 4 + list.len(data)
+    list.concat([code, id, n >> 8, n & 255], data)
+
+// The frame the peer sends for a protocol and an information field.
+fn to_wire(proto: Int, info: [Int]) -> [Int]
+    var p: pppframe.PppInfo = Vec.new()
+    for x in info
+        let _ = p.push(x as u8)
+    var w: pppframe.PppWire = Vec.new()
+    let _ = pppframe.frame_encode(proto, var p, pppframe.opts_default(), var w)
+    var out: [Int] = []
+    for i in 0..w.len()
+        list.push(out, w[i] as Int)
+    out
+
+// The peer sends a frame; answer the events.
+fn peer(var s: pppsess.PppSession, proto: Int, info: [Int]) -> Int
+    var ev = 0
+    for b in to_wire(proto, info)
+        ev = ev | pppsess.sess_rx_byte(var s, b)
+    ev
+
+// Every frame the session has to send, each as [protocol, information...].
+fn pull(var s: pppsess.PppSession) -> [[Int]]
+    var out: [[Int]] = []
+    for _i in 0..12
+        var w: pppframe.PppWire = Vec.new()
+        if pppsess.sess_tx(var s, var w)
+            var rx = pppframe.rx_new()
+            pppframe.rx_set_accm(var rx, 0)
+            for j in 0..w.len()
+                if pppframe.rx_byte(var rx, w[j] as Int) == pppframe.PPP_RX_FRAME
+                    var one: [Int] = [rx.proto]
+                    for k in 0..rx.buf.len()
+                        list.push(one, rx.buf[k] as Int)
+                    list.push(out, one)
+    out
+
+// The options a layer is asking for, as a list.
+fn want_list(var s: pppsess.PppSession, l: Int) -> [Int]
+    var out: [Int] = []
+    for i in 0..s.want[l].len()
+        list.push(out, s.want[l][i] as Int)
+    out
+
+// The datagram or packet in the receiver, as a list.
+fn rx_list(var s: pppsess.PppSession) -> [Int]
+    var out: [Int] = []
+    for i in 0..s.rx.buf.len()
+        list.push(out, s.rx.buf[i] as Int)
+    out
+
+// A session with a name, a secret and a magic number.
+fn client() -> pppsess.PppSession
+    var s = pppsess.sess_new()
+    pppsess.sess_set_credentials(var s, "user", "pw")
+    pppsess.sess_set_magic(var s, 0x11111111)
+    s
+
+// Open LCP, the peer asking for `auth` ([] for none), and take the frames
+// out.  Answers the events of the last step.
+fn open_lcp(var s: pppsess.PppSession, auth: [Int]) -> Int
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC021, pkt(1, 1, auth))
+    let _ = pull(var s)
+    let ev = peer(var s, 0xC021, pkt(2, s.fsm[0].id, want_list(var s, 0)))
+    if auth == []
+        let _ = pull(var s)
+    ev
+
+// Open LCP with no authentication and IPCP up with the address 192.0.2.7,
+// by the peer's Ack of our request.
+fn open_ipcp(var s: pppsess.PppSession) -> Int
+    let _ = open_lcp(var s, [])
+    let _ = peer(var s, 0x8021, pkt(1, 1, [0x03, 0x06, 0xC0, 0x00, 0x02, 0x01]))
+    let _ = pull(var s)
+    peer(var s, 0x8021, pkt(2, s.fsm[1].id, want_list(var s, 1)))
+
+fn pap() -> [Int]
+    [0x03, 0x04, 0xC0, 0x23]
+
+fn chap() -> [Int]
+    [0x03, 0x05, 0xC2, 0x23, 0x05]
+
+// The PAP request this client sends, with identifier `id`.
+fn pap_request(id: Int) -> [Int]
+    list.concat([0xC023], pkt(1, id, [0x04, 0x75, 0x73, 0x65, 0x72, 0x02, 0x70, 0x77]))
+
+// ── PAP ────────────────────────────────────────────────────────────
+
+@test
+fn test_pap_sends_the_name_and_password_when_the_link_opens() [io]
+    var s = client()
+    test.assert_eq(open_lcp(var s, pap()), pppsess.PPP_EV_LINK_UP)
+    test.assert_eq(s.phase, pppsess.PPP_PH_AUTH)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_WAITING)
+    test.assert_eq(pull(var s), [pap_request(1)])
+
+@test
+fn test_a_pap_ack_starts_the_network_phase() [io]
+    var s = client()
+    let _ = open_lcp(var s, pap())
+    let _ = pull(var s)
+    let ev = peer(var s, 0xC023, pkt(2, 1, [0x00]))
+    test.assert_eq(ev, pppsess.PPP_EV_AUTH_OK)
+    test.assert_eq(s.phase, pppsess.PPP_PH_NETWORK)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_OK)
+    test.assert_eq(pull(var s)[0][0], 0x8021)
+
+@test
+fn test_a_pap_nak_closes_the_link() [io]
+    var s = client()
+    let _ = open_lcp(var s, pap())
+    let _ = pull(var s)
+    let ev = peer(var s, 0xC023, pkt(3, 1, [0x00]))
+    test.assert_eq(ev & pppsess.PPP_EV_AUTH_FAILED, pppsess.PPP_EV_AUTH_FAILED)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_FAILED)
+    test.assert_eq(s.fsm[0].state, 4)
+    let out = pull(var s)
+    test.assert_eq(out[0][0], 0xC021)
+    test.assert_eq(out[0][1], 5)
+
+@test
+fn test_pap_answers_for_another_request_or_of_another_kind_are_ignored() [io]
+    var s = client()
+    let _ = open_lcp(var s, pap())
+    let _ = pull(var s)
+    // The wrong identifier, an Authenticate-Request from the peer (we do not
+    // authenticate peers), a malformed packet, and an unknown code.
+    test.assert_eq(peer(var s, 0xC023, pkt(2, 9, [0x00])), 0)
+    test.assert_eq(peer(var s, 0xC023, pkt(1, 1, [0x01, 0x41, 0x01, 0x42])), 0)
+    test.assert_eq(peer(var s, 0xC023, pkt(9, 1, [0x00])), 0)
+    test.assert_eq(peer(var s, 0xC023, [0x02, 0x01, 0x00]), 0)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_WAITING)
+
+@test
+fn test_a_second_pap_ack_changes_nothing() [io]
+    var s = client()
+    let _ = open_lcp(var s, pap())
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC023, pkt(2, 1, [0x00]))
+    test.assert_eq(peer(var s, 0xC023, pkt(2, 1, [0x00])), 0)
+    test.assert_eq(peer(var s, 0xC023, pkt(3, 1, [0x00])), 0)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_OK)
+
+@test
+fn test_pap_is_ignored_when_the_peer_asked_for_chap() [io]
+    var s = client()
+    let _ = open_lcp(var s, chap())
+    test.assert_eq(peer(var s, 0xC023, pkt(2, 0, [0x00])), 0)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_WAITING)
+
+@test
+fn test_the_pap_request_is_sent_again_every_three_seconds_and_given_up() [io]
+    var s = client()
+    let _ = open_lcp(var s, pap())
+    test.assert_eq(pull(var s), [pap_request(1)])
+    var sent = 1
+    var ev = 0
+    for i in 0..12
+        ev = ev | pppsess.sess_tick(var s, 3000)
+        let out = pull(var s)
+        // The LCP automaton is Opened and does not time out; only the PAP
+        // request comes back, with a new identifier each time.
+        if list.len(out) > 0 and out[0][0] == 0xC023
+            sent = sent + 1
+            test.case("request ${sent}")
+            test.assert_eq(out, [pap_request(sent)])
+    test.assert_eq(sent, 10)
+    test.assert_eq(ev & pppsess.PPP_EV_AUTH_FAILED, pppsess.PPP_EV_AUTH_FAILED)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_FAILED)
+
+@test
+fn test_partial_ticks_wait_for_the_interval_and_idle_ticks_do_nothing() [io]
+    var s = client()
+    let _ = open_lcp(var s, pap())
+    let _ = pull(var s)
+    test.assert_eq(pppsess.sess_tick(var s, 2000), 0)
+    test.assert_eq(pull(var s), [])
+    test.assert_eq(pppsess.sess_tick(var s, 0), 0)
+    test.assert_eq(pppsess.sess_tick(var s, 1000), 0)
+    test.assert_eq(list.len(pull(var s)), 1)
+    // Once authenticated the wait is over.
+    let _ = peer(var s, 0xC023, pkt(2, 2, [0x00]))
+    let _ = pull(var s)
+    test.assert_eq(pppsess.sess_tick(var s, 3000), 0)
+    test.assert_eq(pull(var s)[0][0], 0x8021)
+
+// ── CHAP ───────────────────────────────────────────────────────────
+
+// A Challenge of identifier `id` with a value of `n` bytes of 0x42 and the
+// name "x".
+fn challenge(id: Int, n: Int) -> [Int]
+    var v: [Int] = [n]
+    for _i in 0..n
+        list.push(v, 0x42)
+    pkt(1, id, list.concat(v, [0x78]))
+
+@test
+fn test_a_chap_challenge_is_answered_with_a_response_of_the_same_identifier() [io]
+    var s = client()
+    test.assert_eq(open_lcp(var s, chap()), pppsess.PPP_EV_LINK_UP)
+    test.assert_eq(pull(var s), [])
+    test.assert_eq(peer(var s, 0xC223, challenge(5, 8)), 0)
+    let out = pull(var s)
+    test.assert_eq(out[0][0], 0xC223)
+    test.assert_eq(out[0][1], 2)
+    test.assert_eq(out[0][2], 5)
+    // The value is 16 bytes, then the name "user".
+    test.assert_eq(out[0][5], 16)
+    test.assert_eq(list.len(out[0]), 1 + 4 + 1 + 16 + 4)
+    test.assert_eq(list.slice(out[0], 22, 26), [0x75, 0x73, 0x65, 0x72])
+
+@test
+fn test_chap_success_starts_the_network_phase_and_failure_closes_the_link() [io]
+    var s = client()
+    let _ = open_lcp(var s, chap())
+    let _ = peer(var s, 0xC223, challenge(5, 8))
+    let _ = pull(var s)
+    test.assert_eq(peer(var s, 0xC223, pkt(3, 4, [])), 0)
+    test.assert_eq(s.phase, pppsess.PPP_PH_AUTH)
+    test.assert_eq(peer(var s, 0xC223, pkt(3, 5, [0x4F, 0x4B])), pppsess.PPP_EV_AUTH_OK)
+    test.assert_eq(s.phase, pppsess.PPP_PH_NETWORK)
+    var f = client()
+    let _ = open_lcp(var f, chap())
+    let _ = peer(var f, 0xC223, challenge(6, 8))
+    let _ = pull(var f)
+    test.assert_eq(peer(var f, 0xC223, pkt(4, 5, [])), 0)
+    let ev = peer(var f, 0xC223, pkt(4, 6, [0x4E, 0x4F]))
+    test.assert_eq(ev & pppsess.PPP_EV_AUTH_FAILED, pppsess.PPP_EV_AUTH_FAILED)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_OK)
+    test.assert_eq(f.auth_state, pppsess.PPP_AUTH_FAILED)
+
+@test
+fn test_a_challenge_with_no_value_or_a_value_past_the_packet_is_ignored() [io]
+    var s = client()
+    let _ = open_lcp(var s, chap())
+    test.assert_eq(peer(var s, 0xC223, pkt(1, 1, [0x00, 0x78])), 0)
+    test.assert_eq(peer(var s, 0xC223, pkt(1, 1, [0x20, 0x01, 0x02])), 0)
+    test.assert_eq(peer(var s, 0xC223, [0x01, 0x01, 0x00]), 0)
+    test.assert_eq(pull(var s), [])
+
+@test
+fn test_a_challenge_is_answered_again_in_the_network_phase() [io]
+    var s = client()
+    let _ = open_lcp(var s, chap())
+    let _ = peer(var s, 0xC223, challenge(5, 8))
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC223, pkt(3, 5, []))
+    let _ = pull(var s)
+    test.assert_eq(peer(var s, 0xC223, challenge(9, 16)), 0)
+    test.assert_eq(pull(var s)[0][2], 9)
+    // A Success for it changes nothing; neither does a response of the peer's
+    // or an unknown code.
+    test.assert_eq(peer(var s, 0xC223, pkt(3, 9, [])), 0)
+    test.assert_eq(peer(var s, 0xC223, pkt(2, 9, [0x00])), 0)
+    test.assert_eq(peer(var s, 0xC223, pkt(9, 9, [])), 0)
+    test.assert_eq(s.phase, pppsess.PPP_PH_NETWORK)
+
+@test
+fn test_chap_is_ignored_before_the_link_is_open_or_when_pap_was_asked() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(peer(var s, 0xC223, challenge(1, 8)), 0)
+    var p = client()
+    let _ = open_lcp(var p, pap())
+    let _ = pull(var p)
+    test.assert_eq(peer(var p, 0xC223, challenge(1, 8)), 0)
+    test.assert_eq(pull(var p), [])
+
+// ── IPCP ───────────────────────────────────────────────────────────
+
+@test
+fn test_ipcp_with_a_fixed_address_and_no_dns() [io]
+    var s = client()
+    pppsess.sess_set_ip(var s, 0xC0000207, false)
+    let _ = open_lcp(var s, [])
+    // open_lcp took the first frames out; the request is asked for again by
+    // the timer, and holds the address.
+    test.assert_eq(want_list(var s, 1), [0x03, 0x06, 0xC0, 0x00, 0x02, 0x07])
+    let _ = peer(var s, 0x8021, pkt(1, 1, [0x03, 0x06, 0xC0, 0x00, 0x02, 0x01]))
+    let _ = pull(var s)
+    let ev = peer(var s, 0x8021, pkt(2, s.fsm[1].id, want_list(var s, 1)))
+    test.assert_eq(ev, pppsess.PPP_EV_IPCP_UP)
+    test.assert_eq(s.ip_local, 0xC0000207)
+    test.assert_eq(s.ip_peer, 0xC0000201)
+    test.assert_eq(s.dns1, 0)
+    test.assert_eq(s.dns2, 0)
+
+@test
+fn test_ipcp_options_other_than_the_address_are_rejected() [io]
+    var s = client()
+    let _ = open_lcp(var s, [])
+    // IP-Compression-Protocol (2), the old IP-Addresses (1), a DNS option (129)
+    // and an address of the wrong length.
+    let opts = [0x02, 0x06, 0x00, 0x2D, 0x0F, 0x01, 0x81, 0x06, 0x08, 0x08, 0x08, 0x08, 0x03, 0x04, 0x0A, 0x00]
+    let _ = peer(var s, 0x8021, pkt(1, 4, opts))
+    let out = pull(var s)
+    test.assert_eq(out[0], list.concat([0x8021], pkt(4, 4, opts)))
+
+@test
+fn test_ipcp_packets_are_ignored_until_the_link_is_open() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    test.assert_eq(peer(var s, 0x8021, pkt(1, 1, [0x03, 0x06, 0x0A, 0x00, 0x00, 0x01])), 0)
+    test.assert_eq(pull(var s), [])
+    var a = client()
+    let _ = open_lcp(var a, pap())
+    let _ = pull(var a)
+    // Authenticating: the network protocols wait.
+    test.assert_eq(peer(var a, 0x8021, pkt(1, 1, [0x03, 0x06, 0x0A, 0x00, 0x00, 0x01])), 0)
+    test.assert_eq(pull(var a), [])
+
+@test
+fn test_a_peer_that_keeps_naking_ipcp_is_given_up_on() [io]
+    var s = client()
+    let _ = open_lcp(var s, [])
+    var ev = 0
+    for _i in 0..11
+        ev = ev | peer(var s, 0x8021, pkt(3, s.fsm[1].id, [0x03, 0x06, 0x0A, 0x00, 0x00, 0x09]))
+        let _ = pull(var s)
+    test.assert_eq(ev & pppsess.PPP_EV_NCP_FAILED, pppsess.PPP_EV_NCP_FAILED)
+    test.assert_eq(s.fsm[1].state, 3)
+    test.assert_eq(s.fsm[0].state, 9)
+
+@test
+fn test_ipcp_gives_up_when_nobody_answers() [io]
+    var s = client()
+    let _ = open_lcp(var s, [])
+    var ev = 0
+    for _i in 0..12
+        ev = ev | pppsess.sess_tick(var s, 3000)
+        let _ = pull(var s)
+    test.assert_eq(ev & pppsess.PPP_EV_NCP_FAILED, pppsess.PPP_EV_NCP_FAILED)
+
+@test
+fn test_a_new_ipcp_request_from_the_peer_renegotiates() [io]
+    var s = client()
+    test.assert_eq(open_ipcp(var s), pppsess.PPP_EV_IPCP_UP)
+    // The peer starts again: IPCP leaves Opened, asks again, and opens when
+    // the exchange completes.
+    let down = peer(var s, 0x8021, pkt(1, 2, [0x03, 0x06, 0xC0, 0x00, 0x02, 0x02]))
+    test.assert_eq(down, pppsess.PPP_EV_IPCP_DOWN)
+    test.assert_eq(s.fsm[1].state, 8)
+    let out = pull(var s)
+    test.assert_eq(list.len(out), 2)
+    let up = peer(var s, 0x8021, pkt(2, s.fsm[1].id, want_list(var s, 1)))
+    test.assert_eq(up, pppsess.PPP_EV_IPCP_UP)
+    test.assert_eq(s.ip_peer, 0xC0000202)
+
+@test
+fn test_a_terminate_request_closes_ipcp() [io]
+    var s = client()
+    let _ = open_ipcp(var s)
+    test.assert_eq(peer(var s, 0x8021, pkt(5, 3, [])), pppsess.PPP_EV_IPCP_DOWN)
+    test.assert_eq(pull(var s)[0], list.concat([0x8021], pkt(6, 3, [])))
+
+@test
+fn test_an_lcp_only_code_on_ipcp_is_rejected_as_unknown() [io]
+    var s = client()
+    let _ = open_ipcp(var s)
+    test.assert_eq(peer(var s, 0x8021, pkt(9, 3, [0, 0, 0, 0])), 0)
+    let out = pull(var s)
+    test.assert_eq(out[0][0], 0x8021)
+    test.assert_eq(out[0][1], 7)
+
+@test
+fn test_a_code_reject_on_ipcp_ends_it_when_it_is_a_negotiation_code() [io]
+    var s = client()
+    let _ = open_ipcp(var s)
+    test.assert_eq(peer(var s, 0x8021, pkt(7, 3, pkt(2, 1, []))) & pppsess.PPP_EV_IPCP_DOWN,
+        pppsess.PPP_EV_IPCP_DOWN)
+
+@test
+fn test_datagrams_are_taken_only_while_their_layer_is_open() [io]
+    var s = client()
+    let _ = open_lcp(var s, [])
+    let d = [0x45, 0x00, 0x00, 0x14]
+    test.assert_eq(peer(var s, 0x0021, d), 0)
+    test.assert_eq(peer(var s, 0x0057, d), 0)
+    var a = client()
+    let _ = open_lcp(var a, chap())
+    test.assert_eq(peer(var a, 0x0021, d), 0)
+    var o = client()
+    let _ = open_ipcp(var o)
+    test.assert_eq(peer(var o, 0x0021, d), pppsess.PPP_EV_IP_PACKET)
+    test.assert_eq(rx_list(var o), d)
+    // IPv6 is not enabled: the datagram is dropped, and its control protocol
+    // is rejected.
+    test.assert_eq(peer(var o, 0x0057, d), 0)
+    test.assert_eq(peer(var o, 0x8057, pkt(1, 1, [])), 0)
+    test.assert_eq(pull(var o)[0][1], 8)
+
+@test
+fn test_a_datagram_is_sent_framed_with_the_options_in_force() [io]
+    var s = client()
+    let _ = open_ipcp(var s)
+    var d: pppframe.PppInfo = Vec.new()
+    for b in [0x45, 0x00, 0x00, 0x14]
+        let _ = d.push(b as u8)
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IP, var d, var w), true)
+    // The peer asked for nothing: the full header, every control character
+    // escaped.
+    test.assert_eq(w[0], 0x7E)
+    test.assert_eq(w[1], 0xFF)
+    test.assert_eq(w[2], 0x7D)
+    test.assert_eq(w[3], 0x23)
+    // The IPv6 layer is not open.
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IPV6, var d, var w), false)
+
+@test
+fn test_a_datagram_longer_than_the_peers_mru_is_refused() [io]
+    var s = client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC021, pkt(1, 1, [0x01, 0x04, 0x00, 0x40]))
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC021, pkt(2, s.fsm[0].id, want_list(var s, 0)))
+    let _ = pull(var s)
+    let _ = peer(var s, 0x8021, pkt(1, 1, [0x03, 0x06, 0xC0, 0x00, 0x02, 0x01]))
+    let _ = pull(var s)
+    let _ = peer(var s, 0x8021, pkt(2, s.fsm[1].id, want_list(var s, 1)))
+    test.assert_eq(s.tx_mru, 64)
+    var d: pppframe.PppInfo = Vec.new()
+    for _i in 0..65
+        let _ = d.push(0x41)
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IP, var d, var w), false)
+    var ok: pppframe.PppInfo = Vec.new()
+    for _i in 0..64
+        let _ = ok.push(0x41)
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IP, var ok, var w), true)
+
+@test
+fn test_a_datagram_that_does_not_fit_the_wire_is_refused() [io]
+    var s = client()
+    let _ = open_ipcp(var s)
+    var d: pppframe.PppInfo = Vec.new()
+    let _ = d.push(0x45)
+    var w: pppframe.PppWire = Vec.new()
+    for _i in 0..pppframe.PPP_WIRE_MAX
+        let _ = w.push(0x55)
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IP, var d, var w), false)
+
+// ── IPv6CP ─────────────────────────────────────────────────────────
+
+fn v6_client() -> pppsess.PppSession
+    var s = client()
+    pppsess.sess_set_ipv6(var s, true, 0x02005EFF, 0xFE000001)
+    s
+
+@test
+fn test_ipv6cp_asks_for_the_interface_identifier() [io]
+    var s = v6_client()
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC021, pkt(1, 1, []))
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC021, pkt(2, s.fsm[0].id, want_list(var s, 0)))
+    let out = pull(var s)
+    test.assert_eq(list.len(out), 2)
+    test.assert_eq(out[1],
+        list.concat([0x8057], pkt(1, 1, [0x01, 0x0A, 0x02, 0x00, 0x5E, 0xFF, 0xFE, 0x00, 0x00, 0x01])))
+
+@test
+fn test_ipv6cp_opens_and_carries_ipv6_datagrams() [io]
+    var s = v6_client()
+    let _ = open_lcp(var s, [])
+    let _ = peer(var s, 0x8057, pkt(1, 1, [0x01, 0x0A, 0xFE, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09]))
+    let ack = pull(var s)
+    test.assert_eq(ack[0][0], 0x8057)
+    test.assert_eq(ack[0][1], 2)
+    let ev = peer(var s, 0x8057, pkt(2, s.fsm[2].id, want_list(var s, 2)))
+    test.assert_eq(ev, pppsess.PPP_EV_IPV6CP_UP)
+    test.assert_eq(s.id6_local_hi, 0x02005EFF)
+    test.assert_eq(s.id6_local_lo, 0xFE000001)
+    test.assert_eq(s.id6_peer_hi, 0xFE800000)
+    test.assert_eq(s.id6_peer_lo, 0x00000009)
+    let d = [0x60, 0x00, 0x00, 0x00]
+    test.assert_eq(peer(var s, 0x0057, d), pppsess.PPP_EV_IPV6_PACKET)
+    var info: pppframe.PppInfo = Vec.new()
+    for b in d
+        let _ = info.push(b as u8)
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IPV6, var info, var w), true)
+
+@test
+fn test_a_zero_or_equal_peer_identifier_is_nakd_with_another() [io]
+    for id in [[0, 0, 0, 0, 0, 0, 0, 0], [0x02, 0x00, 0x5E, 0xFF, 0xFE, 0x00, 0x00, 0x01]]
+        var s = v6_client()
+        let _ = open_lcp(var s, [])
+        let _ = peer(var s, 0x8057, pkt(1, 3, list.concat([0x01, 0x0A], id)))
+        let out = pull(var s)
+        test.assert_eq(out[0],
+            list.concat([0x8057], pkt(3, 3, [0x01, 0x0A, 0x02, 0x00, 0x5E, 0xFF, 0xFE, 0x00, 0x00, 0x00])))
+
+@test
+fn test_an_identifier_equal_to_ours_once_open_is_nakd_too() [io]
+    var s = v6_client()
+    let _ = open_lcp(var s, [])
+    let _ = peer(var s, 0x8057, pkt(1, 1, [0x01, 0x0A, 0xFE, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09]))
+    let _ = pull(var s)
+    let _ = peer(var s, 0x8057, pkt(2, s.fsm[2].id, want_list(var s, 2)))
+    test.assert_eq(s.fsm[2].state, 9)
+    let _ = peer(var s, 0x8057, pkt(1, 2, [0x01, 0x0A, 0x02, 0x00, 0x5E, 0xFF, 0xFE, 0x00, 0x00, 0x01]))
+    test.assert_eq(pull(var s)[0][1], 3)
+
+@test
+fn test_ipv6cp_rejects_other_options_and_a_bad_length() [io]
+    var s = v6_client()
+    let _ = open_lcp(var s, [])
+    let opts = [0x02, 0x04, 0x00, 0x57, 0x01, 0x06, 0x00, 0x00, 0x00, 0x00]
+    let _ = peer(var s, 0x8057, pkt(1, 5, opts))
+    test.assert_eq(pull(var s)[0], list.concat([0x8057], pkt(4, 5, opts)))
+
+@test
+fn test_a_nak_of_our_identifier_is_taken() [io]
+    var s = pppsess.sess_new()
+    pppsess.sess_set_ipv6(var s, true, 0, 0)
+    let _ = pppsess.sess_start(var s)
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC021, pkt(1, 1, []))
+    let _ = pull(var s)
+    let _ = peer(var s, 0xC021, pkt(2, s.fsm[0].id, want_list(var s, 0)))
+    let first = pull(var s)
+    test.assert_eq(first[1][1], 1)
+    let nak = [0x01, 0x0A, 0x02, 0x00, 0x5E, 0xFF, 0xFE, 0x00, 0x00, 0x07]
+    let _ = peer(var s, 0x8057, pkt(3, s.fsm[2].id, nak))
+    let again = pull(var s)
+    test.assert_eq(again[0], list.concat([0x8057], pkt(1, 2, nak)))

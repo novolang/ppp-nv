@@ -4,7 +4,8 @@
 // `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The standard
 // library's MD5 answers a hex string and is not part of the embedded tier,
 // and a modem client on a microcontroller is exactly where CHAP is needed,
-// so the package carries the hash itself.  It is a streaming hash: a byte
+// so the package carries the hash itself.  (crypto-nv has an MD5 as well; this
+// one is about 120 lines and keeps the package free of a dependency.)  It is a streaming hash: a byte
 // goes in with `md5_byte` and the digest comes out of `md5_finish`, so the
 // three parts of the CHAP response (the identifier, the secret and the
 // challenge) are folded in where they sit and never joined.
@@ -62,7 +63,7 @@ const MD5_S = [
 // A hash in progress: the four state words, the block being filled, and the
 // number of bytes taken so far.
 pub @value
-struct Md5
+struct ChapMd5
     // State word A.
     a: Int
     // State word B.
@@ -87,15 +88,20 @@ struct Md5
 // ```
 pub @tier(embedded)
 @no_alloc
-fn md5_new() -> Md5 []
-    Md5 { a: 0x67452301, b: 0xEFCDAB89, c: 0x98BADCFE, d: 0x10325476, block: Vec.new(), count: 0 }
+fn md5_new() -> ChapMd5 []
+    ChapMd5 { a: 0x67452301,
+        b: 0xEFCDAB89,
+        c: 0x98BADCFE,
+        d: 0x10325476,
+        block: Vec.new(),
+        count: 0 }
 
 // The word `g` of the block, low byte first.
 @tier(embedded)
 @no_alloc
-fn word(var m: Md5, g: Int) -> Int []
-    (m.block[4 * g] as Int) | ((m.block[4 * g + 1] as Int) << 8) | ((m.block[4 * g + 2] as Int) << 16)
-        | ((m.block[4 * g + 3] as Int) << 24)
+fn word(var m: ChapMd5, g: Int) -> Int []
+    m.block[4 * g] as Int | (m.block[4 * g + 1] as Int << 8) | (m.block[4 * g + 2] as Int << 16)
+        | (m.block[4 * g + 3] as Int << 24)
 
 // Rotate the 32-bit number `x` left by `s` bits, `s` from 1 to 31.
 @tier(embedded)
@@ -106,7 +112,7 @@ fn rotl(x: Int, s: Int) -> Int []
 // Mix the full block into the state and empty it.
 @tier(embedded)
 @no_alloc
-fn transform(var m: Md5) []
+fn transform(var m: ChapMd5) []
     var a = m.a
     var b = m.b
     var c = m.c
@@ -149,7 +155,7 @@ fn transform(var m: Md5) []
 // ```
 pub @tier(embedded)
 @no_alloc
-fn md5_byte(var m: Md5, b: Int) []
+fn md5_byte(var m: ChapMd5, b: Int) []
     let _ = m.block.push((b & 0xFF) as u8)
     m.count = m.count + 1
     if m.block.len() == 64
@@ -171,7 +177,7 @@ fn md5_byte(var m: Md5, b: Int) []
 // ```
 pub @tier(embedded)
 @no_alloc
-fn md5_finish(var m: Md5, var out: Md5Digest) []
+fn md5_finish(var m: ChapMd5, var out: Md5Digest) []
     let nbits = m.count * 8
     md5_byte(var m, 0x80)
     for _i in 0..64
@@ -188,7 +194,7 @@ fn md5_finish(var m: Md5, var out: Md5Digest) []
 // State word `i`, 0 to 3.
 @tier(embedded)
 @no_alloc
-fn state_word(var m: Md5, i: Int) -> Int []
+fn state_word(var m: ChapMd5, i: Int) -> Int []
     if i == 0
         return m.a
     if i == 1

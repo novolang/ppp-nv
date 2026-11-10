@@ -18,7 +18,6 @@
 // recomputed from the sine.
 
 use std.crypto
-use std.list
 use std.math
 use std.str
 use std.test

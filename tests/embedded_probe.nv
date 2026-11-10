@@ -1,0 +1,311 @@
+// tests/embedded_probe.nv — this package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// THE CONSUMER IS A CELLULAR MODEM CLIENT: a Cortex-M with a module such as
+// a SIMCom or u-blox part on its UART, no heap, and no IP stack of the
+// module's own.  The firmware dials with `ATD*99#`, waits for `CONNECT`, and
+// then speaks PPP to the network through the module: it negotiates the link,
+// answers the network's CHAP challenge, takes the IP address and the DNS
+// servers IPCP assigns, and moves datagrams.  Everything it decides is here
+// and is compiled for the hardware rather than claimed.
+//
+// The self-test plays the network side from the same package: the peer's
+// packets are built with `pppcp` and framed with `pppframe`, and the session
+// is fed them a byte at a time.  What it checks, with the number of checks
+// each adds:
+//
+//   - the session's first frame is an LCP Configure-Request with the
+//     default header (2)
+//   - the peer's request, asking for CHAP, is acknowledged and the link
+//     opens when the peer acknowledges ours (3)
+//   - the CHAP challenge is answered with a response of 16 bytes of MD5 and
+//     the name, and the success starts the network phase (3)
+//   - IPCP assigns the address 100.72.3.9 and the DNS servers 8.8.8.8 and
+//     8.8.4.4 by Configure-Nak, and opens (4)
+//   - a datagram of 20 bytes goes out and one comes in (3)
+//   - the frame check sequences hold: the RFC 1662 check value of the 16-bit
+//     FCS, and MD5 of "abc" (2)
+//   - the arena was asked for no bytes while it ran (1)
+//
+// The score is the sum, and a device that disagrees with the host prints how
+// many it lost.  The session, the wire and the packet buffers are all in the
+// frame; nothing is allocated.
+//
+// After the self-test the firmware dials and runs the link: it reads the
+// UART a byte at a time, gives each byte to the session, writes every frame
+// the session has to send, and lets one millisecond pass per turn of the
+// loop.
+
+use std.str
+use pppcp
+use pppfcs
+use pppframe
+use pppmd5
+use pppsess
+
+// Frame the packet in `info` for protocol `proto` as the peer would, and give
+// it to the session byte by byte; answer the events.
+@tier(embedded)
+@no_alloc
+fn peer_sends(var s: PppSession, proto: Int, var info: PppInfo) -> Int []
+    var w: PppWire = Vec.new()
+    let _ = pppframe.frame_encode(proto, var info, pppframe.opts_default(), var w)
+    var ev = 0
+    for i in 0..w.len()
+        ev = ev | pppsess.sess_rx_byte(var s, w[i] as Int)
+    ev
+
+// Take the session's next frame and answer its information field in `info`
+// and its protocol, or -1 when there is none.
+@tier(embedded)
+@no_alloc
+fn take(var s: PppSession, var info: PppInfo) -> Int []
+    var w: PppWire = Vec.new()
+    if not pppsess.sess_tx(var s, var w)
+        return -1
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0)
+    var proto = -1
+    for i in 0..w.len()
+        if pppframe.rx_byte(var rx, w[i] as Int) == pppframe.PPP_RX_FRAME
+            proto = rx.proto
+            info.clear()
+            for j in 0..rx.buf.len()
+                let _ = info.push(rx.buf[j])
+    proto
+
+// Begin the peer's packet in `p`.
+@tier(embedded)
+@no_alloc
+fn begin(var p: PppInfo, code: Int, id: Int) []
+    pppcp.cp_begin(var p, code, id)
+
+// The peer's LCP request: MRU 1500, magic 0x543, and CHAP with MD5.
+@tier(embedded)
+@no_alloc
+fn peer_lcp_request(var p: PppInfo) []
+    begin(var p, 1, 1)
+    pppcp.cp_put8(var p, 1)
+    pppcp.cp_put8(var p, 4)
+    pppcp.cp_put16(var p, 1500)
+    pppcp.cp_put8(var p, 5)
+    pppcp.cp_put8(var p, 6)
+    pppcp.cp_put32(var p, 0x543)
+    pppcp.cp_put8(var p, 3)
+    pppcp.cp_put8(var p, 5)
+    pppcp.cp_put16(var p, 0xC223)
+    pppcp.cp_put8(var p, 5)
+    pppcp.cp_end(var p)
+
+// A packet of `code` and `id` holding the options of `opts`.
+@tier(embedded)
+@no_alloc
+fn peer_options(var p: PppInfo, var opts: PppOpts, code: Int, id: Int) []
+    pppcp.opts_packet(var opts, var p, code, id)
+
+// The LCP exchange: two checks for the first frame and three for the opening.
+@tier(embedded)
+@no_alloc
+fn lcp_score(var s: PppSession) -> Int []
+    var n = 0
+    var info: PppInfo = Vec.new()
+    let _ = pppsess.sess_start(var s)
+    let first = take(var s, var info)
+    if first == pppframe.PPP_P_LCP and info[0] == 1
+        n = n + 1
+    if info.len() == 4 + 6 + 6 and info[1] == 1
+        n = n + 1
+    var p: PppInfo = Vec.new()
+    peer_lcp_request(var p)
+    let _ = peer_sends(var s, pppframe.PPP_P_LCP, var p)
+    if take(var s, var info) == pppframe.PPP_P_LCP and info[0] == 2
+        n = n + 1
+    peer_options(var p, var s.want[0], 2, s.fsm[0].id)
+    if peer_sends(var s, pppframe.PPP_P_LCP, var p) == PPP_EV_LINK_UP
+        n = n + 1
+    if s.peer_auth == pppframe.PPP_P_CHAP
+        n = n + 1
+    n
+
+// The CHAP exchange: three checks.
+@tier(embedded)
+@no_alloc
+fn chap_score(var s: PppSession) -> Int []
+    var n = 0
+    var info: PppInfo = Vec.new()
+    var p: PppInfo = Vec.new()
+    begin(var p, 1, 0x21)
+    pppcp.cp_put8(var p, 16)
+    for i in 0..16
+        pppcp.cp_put8(var p, 0x10 + i)
+    pppcp.cp_put8(var p, 0x67)
+    pppcp.cp_end(var p)
+    let _ = peer_sends(var s, pppframe.PPP_P_CHAP, var p)
+    let proto = take(var s, var info)
+    if proto == pppframe.PPP_P_CHAP and info[0] == 2 and info[1] == 0x21
+        n = n + 1
+    if info[4] == 16 and info.len() == 4 + 1 + 16 + str.len("probe")
+        n = n + 1
+    begin(var p, 3, 0x21)
+    pppcp.cp_end(var p)
+    if peer_sends(var s, pppframe.PPP_P_CHAP, var p) == PPP_EV_AUTH_OK
+        n = n + 1
+    n
+
+// The IPCP exchange: four checks.
+@tier(embedded)
+@no_alloc
+fn ipcp_score(var s: PppSession) -> Int []
+    var n = 0
+    var info: PppInfo = Vec.new()
+    var p: PppInfo = Vec.new()
+    let first = take(var s, var info)
+    if first == pppframe.PPP_P_IPCP and info[0] == 1
+        n = n + 1
+    begin(var p, 1, 1)
+    pppcp.cp_put8(var p, 3)
+    pppcp.cp_put8(var p, 6)
+    pppcp.cp_put32(var p, 0x0A404040)
+    pppcp.cp_end(var p)
+    let _ = peer_sends(var s, pppframe.PPP_P_IPCP, var p)
+    let _ = take(var s, var info)
+    begin(var p, 3, s.fsm[1].id)
+    pppcp.cp_put8(var p, 3)
+    pppcp.cp_put8(var p, 6)
+    pppcp.cp_put32(var p, 0x64480309)
+    pppcp.cp_put8(var p, 129)
+    pppcp.cp_put8(var p, 6)
+    pppcp.cp_put32(var p, 0x08080808)
+    pppcp.cp_put8(var p, 131)
+    pppcp.cp_put8(var p, 6)
+    pppcp.cp_put32(var p, 0x08080404)
+    pppcp.cp_end(var p)
+    let _ = peer_sends(var s, pppframe.PPP_P_IPCP, var p)
+    let again = take(var s, var info)
+    if again == pppframe.PPP_P_IPCP and info[0] == 1 and info[1] == 2
+        n = n + 1
+    peer_options(var p, var s.want[1], 2, s.fsm[1].id)
+    if peer_sends(var s, pppframe.PPP_P_IPCP, var p) == PPP_EV_IPCP_UP
+        n = n + 1
+    if s.ip_local == 0x64480309 and s.dns1 == 0x08080808 and s.dns2 == 0x08080404
+        n = n + 1
+    n
+
+// A datagram out and one in: three checks.
+@tier(embedded)
+@no_alloc
+fn data_score(var s: PppSession) -> Int []
+    var n = 0
+    var d: PppInfo = Vec.new()
+    for i in 0..20
+        let _ = d.push((0x45 + i) as u8)
+    var w: PppWire = Vec.new()
+    if pppsess.sess_send(var s, pppframe.PPP_P_IP, var d, var w)
+        n = n + 1
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0)
+    var got = 0
+    for i in 0..w.len()
+        if pppframe.rx_byte(var rx, w[i] as Int) == pppframe.PPP_RX_FRAME
+            got = rx.proto
+    if got == pppframe.PPP_P_IP and rx.buf.len() == 20 and rx.buf[19] == 0x58
+        n = n + 1
+    if peer_sends(var s, pppframe.PPP_P_IP, var d) == PPP_EV_IP_PACKET and s.rx.buf.len() == 20
+        n = n + 1
+    n
+
+// The check values: two checks.
+@tier(embedded)
+@no_alloc
+fn check_score() -> Int []
+    var n = 0
+    var f = pppfcs.PPP_FCS16_INIT
+    for i in 0..9
+        f = pppfcs.fcs16_update(f, 0x31 + i)
+    if pppfcs.fcs16_wire(f) == 0x906E
+        n = n + 1
+    var m = pppmd5.md5_new()
+    pppmd5.md5_byte(var m, 0x61)
+    pppmd5.md5_byte(var m, 0x62)
+    pppmd5.md5_byte(var m, 0x63)
+    var d: pppmd5.Md5Digest = Vec.new()
+    pppmd5.md5_finish(var m, var d)
+    if d[0] == 0x90 and d[1] == 0x01 and d[14] == 0x7F and d[15] == 0x72
+        n = n + 1
+    n
+
+// A session configured as the self-test needs: the name "probe".
+@tier(embedded)
+@no_alloc
+fn make_session() -> PppSession []
+    var s = pppsess.sess_new()
+    pppsess.sess_set_credentials(var s, "probe", "secret")
+    pppsess.sess_set_magic(var s, 0x1A2B3C4D)
+    pppsess.sess_set_ip(var s, 0, true)
+    s
+
+// Write every frame the session has to send to the UART.
+@tier(rt)
+fn flush(var s: PppSession) [hw]
+    var w: PppWire = Vec.new()
+    for _i in 0..8
+        w.clear()
+        if pppsess.sess_tx(var s, var w)
+            for j in 0..w.len()
+                hal.uart.write_byte(w[j] as Int)
+
+@tier(rt)
+fn main() [hw]
+    bsp.board.init()
+    // 18 is the number of checks in the five parts.  The part scores are
+    // printed on a failure rather than only compared, so a device that
+    // disagrees with the host says where it lost them.
+    let h0 = core.rt.heap_alloced()
+    var t = make_session()
+    let a = lcp_score(var t)
+    let b = chap_score(var t)
+    let c = ipcp_score(var t)
+    let d = data_score(var t)
+    var e = check_score()
+    // The whole self-test, the session and its frames included, asked the arena
+    // for nothing.
+    if core.rt.heap_alloced() == h0
+        e = e + 1
+    if a + b + c + d + e == 18
+        hal.uart.write("PASS: ppp-embedded\n")
+    else
+        hal.uart.write("FAIL: ppp-embedded lcp=")
+        hal.uart.write(str.from_int(a))
+        hal.uart.write(" chap=")
+        hal.uart.write(str.from_int(b))
+        hal.uart.write(" ipcp=")
+        hal.uart.write(str.from_int(c))
+        hal.uart.write(" data=")
+        hal.uart.write(str.from_int(d))
+        hal.uart.write(" check=")
+        hal.uart.write(str.from_int(e))
+        hal.uart.write("\n")
+    // Dial, and wait for the module to say CONNECT.
+    hal.uart.write("ATD*99#\r")
+    var matched = 0
+    for _i in 0..60000
+        if matched < 7
+            let b = hal.uart.try_read_byte()
+            if b == str.byte_at_or("CONNECT", matched, 0)
+                matched = matched + 1
+            elif b >= 0
+                matched = 0
+            hal.timer.delay_ms(1)
+    var s = make_session()
+    let _ = pppsess.sess_start(var s)
+    flush(var s)
+    loop
+        let b = hal.uart.try_read_byte()
+        if b >= 0
+            let ev = pppsess.sess_rx_byte(var s, b)
+            if ev != 0
+                flush(var s)
+        else
+            hal.timer.delay_ms(1)
+            let _ = pppsess.sess_tick(var s, 1)
+            flush(var s)

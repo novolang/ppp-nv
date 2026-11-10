@@ -21,4 +21,5 @@ novo        = ">= 0.24.0"
 # None.  The frame check sequences are this package's own tables, because
 # crc-nv has the CRC-32 but not the CRC-16 of X.25, and MD5 for CHAP is this
 # package's own too: the standard library's is a hex string and is not
-# admitted at the embedded tier.
+# admitted at the embedded tier, and the MD5 of crypto-nv is a dependency this
+# package does not need for one hash.

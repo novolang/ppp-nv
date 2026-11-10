@@ -4,8 +4,8 @@
 // The scenario is the one a modem client lives through after `ATD*99#`
 // answers CONNECT.  Every frame in it, the ones this end sends and the ones
 // the network side sends, is a wire string written out below and produced by
-// a separate program (`pppref.py` in the review notes) that computes the CRC
-// one bit at a time and escapes by the stated map, so that the session is
+// a separate program, `tests/vectors.py`, that computes the CRC one bit at a
+// time and escapes by the stated map, so that the session is
 // checked against bytes it did not write.
 //
 // The configuration is the one pppd prints for an ordinary dial-up client:

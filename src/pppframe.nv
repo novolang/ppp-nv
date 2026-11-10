@@ -152,7 +152,7 @@ fn is_negotiating(proto: Int, var info: PppInfo) -> Bool []
 @tier(embedded)
 @no_alloc
 fn put(var out: PppWire, b: Int, accm: Int) -> Bool []
-    let needs = b == PPP_FLAG or b == PPP_ESC or (b < 0x20 and ((accm >> b) & 1) == 1)
+    let needs = b == PPP_FLAG or b == PPP_ESC or b < 0x20 and ((accm >> b) & 1) == 1
     if needs
         if out.len() + 2 > PPP_WIRE_MAX
             return false

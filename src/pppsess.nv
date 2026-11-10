@@ -68,15 +68,15 @@ use pppframe
 use pppfsm
 use pppmd5
 
-// Phase 0: the link is down.
+// The phase of a link that is down.
 pub const PPP_PH_DEAD = 0
-// Phase 1: LCP is negotiating.
+// The phase in which LCP is negotiating.
 pub const PPP_PH_ESTABLISH = 1
-// Phase 2: LCP is open and this end is authenticating.
+// The phase in which LCP is open and this end is authenticating.
 pub const PPP_PH_AUTH = 2
-// Phase 3: the network control protocols run and datagrams flow.
+// The phase in which the network control protocols run and datagrams flow.
 pub const PPP_PH_NETWORK = 3
-// Phase 4: the link is being terminated.
+// The phase of a link being terminated.
 pub const PPP_PH_TERMINATE = 4
 
 // Event bit: LCP is open.
@@ -439,7 +439,8 @@ fn reset_link(var s: PppSession) []
     s.tx_pfc = false
     s.tx_acfc = false
     pppframe.rx_set_accm(var s.rx, 0xFFFFFFFF)
-    s.auth_state = PPP_AUTH_NONE
+    if s.auth_state != PPP_AUTH_FAILED
+        s.auth_state = PPP_AUTH_NONE
 
 // ── The replies a frame is answered with ────────────────────────────
 
@@ -564,7 +565,7 @@ fn verdict_of(var s: PppSession, l: Int, pos: Int) -> Int []
     if t == 1 and n == 10
         let hi = pppcp.get32(var s.rx.buf, pos + 2)
         let lo = pppcp.get32(var s.rx.buf, pos + 6)
-        if (hi == 0 and lo == 0) or (hi == s.id6_local_hi and lo == s.id6_local_lo)
+        if hi == 0 and lo == 0 or hi == s.id6_local_hi and lo == s.id6_local_lo
             return 1
         if hi == s.cfg_id_hi and lo == s.cfg_id_lo
             return 1
@@ -656,7 +657,7 @@ fn judge_request(var s: PppSession, l: Int) -> Int []
         return 0
     let as_reject = s.naks_sent[l] >= PPP_MAX_FAILURE
     var code = PPP_CP_CONF_ACK
-    if rejs > 0 or (naks > 0 and as_reject)
+    if rejs > 0 or naks > 0 and as_reject
         code = PPP_CP_CONF_REJ
     elif naks > 0
         code = PPP_CP_CONF_NAK
@@ -669,7 +670,7 @@ fn judge_request(var s: PppSession, l: Int) -> Int []
             let v = verdict_of(var s, l, pos)
             if code == PPP_CP_CONF_ACK
                 pppcp.copy_opt(var s.out, var s.rx.buf, pos)
-            elif code == PPP_CP_CONF_REJ and (v == 2 or (v == 1 and as_reject))
+            elif code == PPP_CP_CONF_REJ and (v == 2 or v == 1 and as_reject)
                 pppcp.copy_opt(var s.out, var s.rx.buf, pos)
             elif code == PPP_CP_CONF_NAK and v == 1
                 suggest(var s, l, pos)
@@ -839,11 +840,8 @@ fn take_reject(var s: PppSession, l: Int) []
     for _i in 0..64
         if pos < end
             let n = pppcp.opt_len_at(var s.rx.buf, pos)
-            if n > 0
-                pppcp.opts_remove(var s.want[l], pppcp.get8(var s.rx.buf, pos))
-                pos = pos + n
-            else
-                pos = end
+            pppcp.opts_remove(var s.want[l], pppcp.get8(var s.rx.buf, pos))
+            pos = pos + n
 
 // A Configure-Nak or Configure-Reject has been taken `PPP_MAX_NAKS_RECEIVED`
 // times in a row: the peer will not agree.
@@ -1057,6 +1055,7 @@ fn sess_start(var s: PppSession) -> Int []
         return 0
     build_wants(var s)
     reset_link(var s)
+    s.auth_state = PPP_AUTH_NONE
     s.pend = 0
     s.out_pending = false
     pppframe.rx_reset(var s.rx)

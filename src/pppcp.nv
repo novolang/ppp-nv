@@ -453,7 +453,7 @@ fn opts_get32(var o: PppOpts, t: Int, at: Int, missing: Int) -> Int []
         return missing
     var v = 0
     for i in 0..4
-        v = (v << 8) | (o[pos + 2 + at + i] as Int)
+        v = (v << 8) | o[pos + 2 + at + i] as Int
     v
 
 // The 16-bit value of the option of type `t`, or `missing`.
@@ -472,7 +472,7 @@ fn opts_get16(var o: PppOpts, t: Int, missing: Int) -> Int []
     let pos = opts_find(var o, t)
     if pos < 0 or (o[pos + 1] as Int) < 4
         return missing
-    ((o[pos + 2] as Int) << 8) | (o[pos + 3] as Int)
+    (o[pos + 2] as Int << 8) | o[pos + 3] as Int
 
 // Take the first option of type `t` out of the list.  A list without one is
 // left as it is.
