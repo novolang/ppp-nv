@@ -1,0 +1,256 @@
+// pppsess_link_tests.nv — a whole PPP link to a cellular network, byte for
+// byte.
+//
+// The scenario is the one a modem client lives through after `ATD*99#`
+// answers CONNECT.  Every frame in it, the ones this end sends and the ones
+// the network side sends, is a wire string written out below and produced by
+// a separate program (`pppref.py` in the review notes) that computes the CRC
+// one bit at a time and escapes by the stated map, so that the session is
+// checked against bytes it did not write.
+//
+// The configuration is the one pppd prints for an ordinary dial-up client:
+// "asyncmap 0", a magic number, "pcomp" and "accomp".  The first frame is
+// that client's Configure-Request as it appears in a pppd debug log posted to
+// the lwIP users list (https://lists.nongnu.org/archive/html/lwip-users/2016-02/msg00096.html):
+//
+//     sent [LCP ConfReq id=0x1 <asyncmap 0x0> <magic 0xcf2759c0> <pcomp> <accomp>]
+//
+// which is, as a packet, code 1, id 1, length 20, then the options in that
+// order, 02 06 00000000, 05 06 CF2759C0, 07 02, 08 02.  The peer's request is
+// the one from the same log, with the options in the order pppd printed
+// them:
+//
+//     rcvd [LCP ConfReq id=0x1 <accomp> <pcomp> <asyncmap 0x0> <mru 1500> <magic 0x543> <auth 0xc223 05>]
+//
+// that is 08 02, 07 02, 02 06 00000000, 01 04 05DC, 05 06 00000543 and
+// 03 05 C223 05 (CHAP, algorithm 5, MD5), length 29.  The log's author's
+// client wanted PAP and sent a Nak; this client has a secret and Acks.
+//
+// The steps, with who sends what:
+//
+//     us    LCP Configure-Request id 1                      (default form: every control character escaped)
+//     peer  LCP Configure-Request id 1                      we Ack it, state Ack-Sent
+//     us    LCP Configure-Ack id 1
+//     peer  LCP Configure-Ack id 1                          LCP opens; the peer wants CHAP
+//     peer  CHAP Challenge id 0x21, 16 bytes, name "ggsn"
+//     us    CHAP Response id 0x21: MD5(21 | "secret" | challenge) = D1D7EC37 1E050CA1 DC38F052 14F9E821, name "internet"
+//     peer  CHAP Success                                    the network phase begins
+//     us    IPCP Configure-Request id 1: address 0, DNS 0, DNS 0
+//     peer  IPCP Configure-Request id 1: address 10.64.64.64          we Ack it
+//     peer  IPCP Configure-Nak id 1: 100.72.3.9, DNS 8.8.8.8, 8.8.4.4
+//     us    IPCP Configure-Request id 2 with those values
+//     peer  IPCP Configure-Ack id 2                         IPCP opens
+//     us    a datagram of 20 bytes, protocol 0x0021 in one byte (the peer sent "pcomp")
+//     peer  a datagram, in the full form
+//     peer  LCP Echo-Request id 5, magic 0x543, data DE AD   we answer with our magic
+//     us    LCP Terminate-Request id 2 after `sess_close`
+//     peer  LCP Terminate-Ack id 2                          the link is finished
+//
+// After LCP opens, this end's frames leave the address and control out and
+// compress the protocol, and escape only 7E and 7D, because the peer's request
+// said "accomp", "pcomp" and "asyncmap 0".  The CHAP digest is the MD5 of the
+// bytes 21, "secret" and 10 11 .. 1F, which `hashlib` gives as
+// D1D7EC371E050CA1DC38F05214F9E821.
+
+use std.list
+use std.test
+use pppframe
+use pppsess
+
+// The bytes of a wire buffer as a list.
+fn list_of(var w: pppframe.PppWire) -> [Int]
+    var out: [Int] = []
+    for i in 0..w.len()
+        list.push(out, w[i] as Int)
+    out
+
+// Feed a list of wire bytes to the session; answer the events ORed.
+fn feed(var s: pppsess.PppSession, w: [Int]) -> Int
+    var ev = 0
+    for b in w
+        ev = ev | pppsess.sess_rx_byte(var s, b)
+    ev
+
+// The next frame the session sends, as bytes; an empty list when none.
+fn next_frame(var s: pppsess.PppSession) -> [Int]
+    var w: pppframe.PppWire = Vec.new()
+    if pppsess.sess_tx(var s, var w)
+        return list_of(var w)
+    []
+
+// The datagram in the receiver as a list.
+fn rx_list(var s: pppsess.PppSession) -> [Int]
+    var out: [Int] = []
+    for i in 0..s.rx.buf.len()
+        list.push(out, s.rx.buf[i] as Int)
+    out
+
+fn us_lcp_req() -> [Int]
+    [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x21, 0x7D, 0x21, 0x7D, 0x20, 0x7D, 0x34, 0x7D, 0x22,
+     0x7D, 0x26, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x25, 0x7D, 0x26, 0xCF, 0x27,
+     0x59, 0xC0, 0x7D, 0x27, 0x7D, 0x22, 0x7D, 0x28, 0x7D, 0x22, 0x70, 0x84, 0x7E]
+
+fn peer_lcp_req() -> [Int]
+    [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x21, 0x7D, 0x21, 0x7D, 0x20, 0x7D, 0x3D, 0x7D, 0x28,
+     0x7D, 0x22, 0x7D, 0x27, 0x7D, 0x22, 0x7D, 0x22, 0x7D, 0x26, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20,
+     0x7D, 0x20, 0x7D, 0x21, 0x7D, 0x24, 0x7D, 0x25, 0xDC, 0x7D, 0x25, 0x7D, 0x26, 0x7D, 0x20, 0x7D,
+     0x20, 0x7D, 0x25, 0x43, 0x7D, 0x23, 0x7D, 0x25, 0xC2, 0x23, 0x7D, 0x25, 0x5C, 0x67, 0x7E]
+
+fn us_lcp_ack() -> [Int]
+    [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x22, 0x7D, 0x21, 0x7D, 0x20, 0x7D, 0x3D, 0x7D, 0x28,
+     0x7D, 0x22, 0x7D, 0x27, 0x7D, 0x22, 0x7D, 0x22, 0x7D, 0x26, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20,
+     0x7D, 0x20, 0x7D, 0x21, 0x7D, 0x24, 0x7D, 0x25, 0xDC, 0x7D, 0x25, 0x7D, 0x26, 0x7D, 0x20, 0x7D,
+     0x20, 0x7D, 0x25, 0x43, 0x7D, 0x23, 0x7D, 0x25, 0xC2, 0x23, 0x7D, 0x25, 0x7D, 0x3E, 0x64, 0x7E]
+
+fn peer_lcp_ack() -> [Int]
+    [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x22, 0x7D, 0x21, 0x7D, 0x20, 0x7D, 0x34, 0x7D, 0x22,
+     0x7D, 0x26, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x25, 0x7D, 0x26, 0xCF, 0x27,
+     0x59, 0xC0, 0x7D, 0x27, 0x7D, 0x22, 0x7D, 0x28, 0x7D, 0x22, 0x9B, 0xED, 0x7E]
+
+fn peer_chap_challenge() -> [Int]
+    [0x7E, 0xFF, 0x03, 0xC2, 0x23, 0x01, 0x21, 0x00, 0x19, 0x10, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+     0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x67, 0x67, 0x73, 0x6E, 0x3C, 0x04,
+     0x7E]
+
+fn us_chap_response() -> [Int]
+    [0x7E, 0xC2, 0x23, 0x02, 0x21, 0x00, 0x1D, 0x10, 0xD1, 0xD7, 0xEC, 0x37, 0x1E, 0x05, 0x0C, 0xA1,
+     0xDC, 0x38, 0xF0, 0x52, 0x14, 0xF9, 0xE8, 0x21, 0x69, 0x6E, 0x74, 0x65, 0x72, 0x6E, 0x65, 0x74,
+     0x85, 0x7F, 0x7E]
+
+fn peer_chap_success() -> [Int]
+    [0x7E, 0xFF, 0x03, 0xC2, 0x23, 0x03, 0x21, 0x00, 0x0B, 0x57, 0x65, 0x6C, 0x63, 0x6F, 0x6D, 0x65,
+     0x01, 0x6C, 0x7E]
+
+fn us_ipcp_req1() -> [Int]
+    [0x7E, 0x80, 0x21, 0x01, 0x01, 0x00, 0x16, 0x03, 0x06, 0x00, 0x00, 0x00, 0x00, 0x81, 0x06, 0x00,
+     0x00, 0x00, 0x00, 0x83, 0x06, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x4B, 0x7E]
+
+fn peer_ipcp_req() -> [Int]
+    [0x7E, 0xFF, 0x03, 0x80, 0x21, 0x01, 0x01, 0x00, 0x0A, 0x03, 0x06, 0x0A, 0x40, 0x40, 0x40, 0xA9,
+     0xF6, 0x7E]
+
+fn us_ipcp_ack() -> [Int]
+    [0x7E, 0x80, 0x21, 0x02, 0x01, 0x00, 0x0A, 0x03, 0x06, 0x0A, 0x40, 0x40, 0x40, 0xBE, 0x6C, 0x7E]
+
+fn peer_ipcp_nak() -> [Int]
+    [0x7E, 0xFF, 0x03, 0x80, 0x21, 0x03, 0x01, 0x00, 0x16, 0x03, 0x06, 0x64, 0x48, 0x03, 0x09, 0x81,
+     0x06, 0x08, 0x08, 0x08, 0x08, 0x83, 0x06, 0x08, 0x08, 0x04, 0x04, 0x72, 0xF2, 0x7E]
+
+fn us_ipcp_req2() -> [Int]
+    [0x7E, 0x80, 0x21, 0x01, 0x02, 0x00, 0x16, 0x03, 0x06, 0x64, 0x48, 0x03, 0x09, 0x81, 0x06, 0x08,
+     0x08, 0x08, 0x08, 0x83, 0x06, 0x08, 0x08, 0x04, 0x04, 0x0D, 0x61, 0x7E]
+
+fn peer_ipcp_ack() -> [Int]
+    [0x7E, 0xFF, 0x03, 0x80, 0x21, 0x02, 0x02, 0x00, 0x16, 0x03, 0x06, 0x64, 0x48, 0x03, 0x09, 0x81,
+     0x06, 0x08, 0x08, 0x08, 0x08, 0x83, 0x06, 0x08, 0x08, 0x04, 0x04, 0x9B, 0x02, 0x7E]
+
+fn us_datagram() -> [Int]
+    [0x7E, 0x21, 0x45, 0x00, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01, 0x7D, 0x5E, 0x7D, 0x5D,
+     0x64, 0x48, 0x03, 0x09, 0x08, 0x08, 0x08, 0x08, 0xC9, 0x7D, 0x5D, 0x7E]
+
+fn peer_datagram() -> [Int]
+    [0x7E, 0xFF, 0x03, 0x00, 0x21, 0x08, 0x08, 0x08, 0x08, 0x09, 0x03, 0x48, 0x64, 0x7D, 0x5D, 0x7D,
+     0x5E, 0x01, 0x40, 0x00, 0x00, 0x01, 0x00, 0x1C, 0x00, 0x00, 0x45, 0x3E, 0x86, 0x7E]
+
+fn peer_echo_req() -> [Int]
+    [0x7E, 0xFF, 0x03, 0xC0, 0x21, 0x09, 0x05, 0x00, 0x0A, 0x00, 0x00, 0x05, 0x43, 0xDE, 0xAD, 0xDB,
+     0x22, 0x7E]
+
+fn us_echo_rep() -> [Int]
+    [0x7E, 0xC0, 0x21, 0x0A, 0x05, 0x00, 0x0A, 0xCF, 0x27, 0x59, 0xC0, 0xDE, 0xAD, 0xD1, 0x73, 0x7E]
+
+fn us_term_req() -> [Int]
+    [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x25, 0x7D, 0x22, 0x7D, 0x20, 0x7D, 0x24, 0x59, 0x28,
+     0x7E]
+
+fn peer_term_ack() -> [Int]
+    [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x26, 0x7D, 0x22, 0x7D, 0x20, 0x7D, 0x24, 0x94, 0x7D,
+     0x2D, 0x7E]
+
+// A session configured as the log's client is.
+fn client() -> pppsess.PppSession
+    var s = pppsess.sess_new()
+    pppsess.sess_set_credentials(var s, "internet", "secret")
+    pppsess.sess_set_magic(var s, 0xCF2759C0)
+    pppsess.sess_set_accm(var s, 0)
+    pppsess.sess_set_compression(var s, true, true)
+    pppsess.sess_set_ip(var s, 0, true)
+    s
+
+@test
+fn test_a_whole_link_from_dial_to_hang_up() [io]
+    var s = client()
+    test.assert_eq(pppsess.sess_start(var s), 0)
+    test.assert_eq(s.phase, pppsess.PPP_PH_ESTABLISH)
+
+    test.case("the Configure-Request is the log's")
+    test.assert_eq(next_frame(var s), us_lcp_req())
+    test.assert_eq(next_frame(var s), [])
+
+    test.case("the peer's request is acknowledged, option for option")
+    test.assert_eq(feed(var s, peer_lcp_req()), 0)
+    test.assert_eq(s.fsm[0].state, 8)
+    test.assert_eq(next_frame(var s), us_lcp_ack())
+    test.assert_eq(next_frame(var s), [])
+
+    test.case("the peer acknowledges ours and LCP opens")
+    test.assert_eq(feed(var s, peer_lcp_ack()), pppsess.PPP_EV_LINK_UP)
+    test.assert_eq(s.fsm[0].state, 9)
+    test.assert_eq(s.phase, pppsess.PPP_PH_AUTH)
+    test.assert_eq(s.peer_auth, pppframe.PPP_P_CHAP)
+    test.assert_eq(s.peer_magic, 0x543)
+    test.assert_eq(s.peer_mru, 1500)
+    test.assert_eq(s.tx_accm, 0)
+    test.assert_eq(s.tx_pfc, true)
+    test.assert_eq(s.tx_acfc, true)
+    test.assert_eq(s.rx.accm, 0)
+    test.assert_eq(next_frame(var s), [])
+
+    test.case("the challenge is answered with the MD5 response")
+    test.assert_eq(feed(var s, peer_chap_challenge()), 0)
+    test.assert_eq(next_frame(var s), us_chap_response())
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_WAITING)
+
+    test.case("success starts the network phase")
+    test.assert_eq(feed(var s, peer_chap_success()), pppsess.PPP_EV_AUTH_OK)
+    test.assert_eq(s.phase, pppsess.PPP_PH_NETWORK)
+    test.assert_eq(s.auth_state, pppsess.PPP_AUTH_OK)
+    test.assert_eq(next_frame(var s), us_ipcp_req1())
+
+    test.case("IPCP: the peer's address is acknowledged")
+    test.assert_eq(feed(var s, peer_ipcp_req()), 0)
+    test.assert_eq(next_frame(var s), us_ipcp_ack())
+    test.assert_eq(s.ip_peer, 0x0A404040)
+
+    test.case("IPCP: the Nak gives the address and the DNS servers")
+    test.assert_eq(feed(var s, peer_ipcp_nak()), 0)
+    test.assert_eq(next_frame(var s), us_ipcp_req2())
+    test.assert_eq(feed(var s, peer_ipcp_ack()), pppsess.PPP_EV_IPCP_UP)
+    test.assert_eq(s.ip_local, 0x64480309)
+    test.assert_eq(s.dns1, 0x08080808)
+    test.assert_eq(s.dns2, 0x08080404)
+    test.assert_eq(s.fsm[1].state, 9)
+
+    test.case("datagrams go out compressed and come in")
+    var d: pppframe.PppInfo = Vec.new()
+    for b in [0x45, 0x00, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x40, 0x01, 0x7E, 0x7D, 100, 72, 3, 9, 8, 8, 8, 8]
+        let _ = d.push(b as u8)
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppsess.sess_send(var s, pppframe.PPP_P_IP, var d, var w), true)
+    test.assert_eq(list_of(var w), us_datagram())
+    test.assert_eq(feed(var s, peer_datagram()), pppsess.PPP_EV_IP_PACKET)
+    test.assert_eq(rx_list(var s)[0], 8)
+    test.assert_eq(rx_list(var s)[19], 0x45)
+
+    test.case("an Echo-Request is answered with our magic number and its data")
+    test.assert_eq(feed(var s, peer_echo_req()), 0)
+    test.assert_eq(next_frame(var s), us_echo_rep())
+
+    test.case("closing sends a Terminate-Request and ends on the Terminate-Ack")
+    let down = pppsess.sess_close(var s)
+    test.assert_eq(down, pppsess.PPP_EV_LINK_DOWN | pppsess.PPP_EV_IPCP_DOWN)
+    test.assert_eq(s.phase, pppsess.PPP_PH_TERMINATE)
+    test.assert_eq(next_frame(var s), us_term_req())
+    test.assert_eq(feed(var s, peer_term_ack()), pppsess.PPP_EV_CLOSED)
+    test.assert_eq(s.phase, pppsess.PPP_PH_DEAD)
+    test.assert_eq(s.fsm[0].state, 2)

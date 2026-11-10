@@ -1,0 +1,1291 @@
+// pppsess.nv — one PPP link, as a session a caller drives, with no
+// allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  This module joins the
+// parts: the frame of `pppframe`, the negotiation automaton of `pppfsm` run
+// once each for LCP, IPCP and IPv6CP, the option rules of RFC 1661, RFC 1332,
+// RFC 1877 and RFC 5072, and the client side of PAP (RFC 1334) and CHAP with
+// MD5 (RFC 1994).  The session owns no serial port and no clock: the caller
+// reads bytes from its port, writes the bytes the session hands back, and
+// says how much time has passed.
+//
+// THE MODEM PATH.  A cellular module is dialled with `ATD*99#`.  When it
+// answers `CONNECT` the serial port carries PPP and nothing else, and the
+// module's network side is the peer.  This end is the client: it asks to
+// open (`sess_start`), the peer sends its Configure-Request and perhaps asks
+// for CHAP or PAP, the client answers with the credentials the operator
+// issued (`sess_set_credentials`; for most networks any name will do), and
+// IPCP then asks for an address, which the peer Naks with the one it assigns,
+// and for the DNS servers.  `IPCP_UP` is the event that says `ip_local` and
+// the DNS addresses are known.  The `CONNECT` line and every other byte
+// before the first flag are the caller's to read, and bytes that are not
+// frames are counted as frame errors and otherwise ignored.
+//
+// THE CALLER'S LOOP, in four lines:
+//
+//   1. `sess_start` once the port is in data mode, and `sess_tx` until it
+//      answers false, writing each frame it adds to `wire`.
+//   2. For each byte read from the port, `sess_rx_byte`.  It answers a mask
+//      of `PPP_EV_` bits; when one of them is `PPP_EV_IP_PACKET` the datagram
+//      is `s.rx.buf`.
+//   3. After any call that can have queued a reply, which is every call that
+//      answers a nonzero event, `sess_tx` until it is false.  The session
+//      holds one reply at a time (the one it builds in answer to a frame) and
+//      the packets it can build again from its state (Configure-Requests,
+//      Terminate-Requests, the PAP request and the Echo-Request).  A second
+//      reply built before the first was taken replaces it, and `tx_lost`
+//      counts that.
+//   4. Every so often, `sess_tick` with the milliseconds since the last
+//      call, and `sess_tx` after it.  The retransmission of a request is its
+//      doing.
+//
+// WHAT IS NEGOTIATED.  LCP asks the peer for an ACCM, the magic number, and
+// permission to compress the address, control and protocol fields (see
+// `sess_set_accm`, `sess_set_magic`, `sess_set_compression`).  It accepts
+// the peer's MRU, ACCM, magic number and compression, and its choice of PAP
+// or CHAP-MD5 for authenticating this end.  It rejects the options it does
+// not know, the Link Quality protocol among them.  IPCP asks for the IP
+// address and, if told to, the primary and secondary DNS addresses, and takes
+// the peer's address.  IPv6CP, if enabled, negotiates the 64-bit interface
+// identifier.  The session sends a Protocol-Reject for a protocol it does not
+// run, which is how it declines compression (CCP) and Multilink.
+//
+// THE PHASES of RFC 1661 section 3.2 are `s.phase`: Dead, Establish,
+// Authenticate, Network and Terminate.  Network packets are accepted and sent
+// only in the Network phase, while the layer they belong to is Opened.
+//
+// TIME.  The restart timer of each automaton, and the wait between PAP
+// Authenticate-Requests, run on the milliseconds `sess_tick` is given.
+//
+// THE PEER'S AUTHENTICATION.  This end authenticates itself to the peer and
+// does not ask the peer to authenticate: the authentication-protocol option is
+// never put in this end's Configure-Request.  EAP, MS-CHAP and the server
+// side of PAP and CHAP are not here.
+
+use std.str
+use pppcp
+use pppframe
+use pppfsm
+use pppmd5
+
+// Phase 0: the link is down.
+pub const PPP_PH_DEAD = 0
+// Phase 1: LCP is negotiating.
+pub const PPP_PH_ESTABLISH = 1
+// Phase 2: LCP is open and this end is authenticating.
+pub const PPP_PH_AUTH = 2
+// Phase 3: the network control protocols run and datagrams flow.
+pub const PPP_PH_NETWORK = 3
+// Phase 4: the link is being terminated.
+pub const PPP_PH_TERMINATE = 4
+
+// Event bit: LCP is open.
+pub const PPP_EV_LINK_UP = 1
+// Event bit: LCP left the Opened state.
+pub const PPP_EV_LINK_DOWN = 2
+// Event bit: the peer accepted this end's credentials.
+pub const PPP_EV_AUTH_OK = 4
+// Event bit: the peer refused them; the session is closing the link.
+pub const PPP_EV_AUTH_FAILED = 8
+// Event bit: IPCP is open; `ip_local`, `ip_peer`, `dns1` and `dns2` are known.
+pub const PPP_EV_IPCP_UP = 16
+// Event bit: IPCP left the Opened state.
+pub const PPP_EV_IPCP_DOWN = 32
+// Event bit: IPv6CP is open; the interface identifiers are known.
+pub const PPP_EV_IPV6CP_UP = 64
+// Event bit: IPv6CP left the Opened state.
+pub const PPP_EV_IPV6CP_DOWN = 128
+// Event bit: an IPv4 datagram arrived, in `s.rx.buf`.
+pub const PPP_EV_IP_PACKET = 256
+// Event bit: an IPv6 datagram arrived, in `s.rx.buf`.
+pub const PPP_EV_IPV6_PACKET = 512
+// Event bit: LCP finished; the link is dead and the caller hangs up.
+pub const PPP_EV_CLOSED = 1024
+// Event bit: a network control protocol gave up.
+pub const PPP_EV_NCP_FAILED = 2048
+// Event bit: a frame was dropped for a fault.
+pub const PPP_EV_FRAME_ERROR = 4096
+
+// The layer index of LCP.
+pub const PPP_L_LCP = 0
+// The layer index of IPCP.
+pub const PPP_L_IPCP = 1
+// The layer index of IPv6CP.
+pub const PPP_L_IPV6CP = 2
+
+// How many Configure-Naks this end sends in a row before it sends a Reject
+// of the same options instead: 5, the Max-Failure of RFC 1661.
+pub const PPP_MAX_FAILURE = 5
+// How many Configure-Naks or Rejects this end takes in a row before it gives
+// up: 10.
+pub const PPP_MAX_NAKS_RECEIVED = 10
+
+// The authentication state before the peer has asked: 0.
+pub const PPP_AUTH_NONE = 0
+// This end is waiting for the peer to accept its credentials.
+pub const PPP_AUTH_WAITING = 1
+// The peer accepted the credentials.
+pub const PPP_AUTH_OK = 2
+// The peer refused them.
+pub const PPP_AUTH_FAILED = 3
+
+// The pending-packet bit of the PAP request.
+const PEND_PAP = 64
+// The pending-packet bit of the Echo-Request.
+const PEND_ECHO = 128
+
+// One link: the framing, the three layers, the options, the credentials and
+// the queue of what to send.
+//
+// The fields are readable and are not for writing; the functions of this
+// module are the only writers.
+pub @value
+struct PppSession
+    // The receiver: its `buf` and `proto` are the frame just delivered.
+    rx: PppRx
+    // The reply built in answer to a frame, and the scratch the packets that
+    // are built again are made in.
+    out: PppInfo
+    // The protocol `out` is sent with.
+    out_proto: Int
+    // Whether `out` holds a reply the caller has not taken.
+    out_pending: Bool
+    // One of the `PPP_PH_` phases.
+    phase: Int
+    // The automata of LCP, IPCP and IPv6CP, by layer index.
+    fsm: Vec[PppFsm; 3]
+    // The options each layer asks for, by layer index.
+    // workaround(a-cross-module-alias-as-the-element-of-a-heapless-vec-is-not-resolved): the
+    // element is spelled out, `Vec[u8; 64]`, because `PppOpts` from another module is not
+    // resolved inside the type arguments of `Vec`.
+    want: Vec[Vec[u8; 64]; 3]
+    // The Configure-Naks sent in a row, by layer index.
+    naks_sent: Vec[Int; 3]
+    // The Configure-Naks and Rejects taken in a row, by layer index.
+    naks_got: Vec[Int; 3]
+    // The packets to build and send: bit 2n a Configure-Request and bit 2n+1
+    // a Terminate-Request of layer n; 64 the PAP request; 128 an Echo-Request.
+    pend: Int
+    // The magic number to put in LCP.
+    cfg_magic: Int
+    // The ACCM this end asks the peer to honour.
+    cfg_accm: Int
+    // Whether to ask to receive compressed protocol fields.
+    cfg_pfc: Bool
+    // Whether to ask to receive compressed address and control fields.
+    cfg_acfc: Bool
+    // Whether to ask for the DNS addresses.
+    cfg_dns: Bool
+    // The IPv4 address to ask for; 0 to be given one.
+    cfg_addr: Int
+    // Whether to run IPv6CP.
+    cfg_ipv6: Bool
+    // The high half of the interface identifier to ask for.
+    cfg_id_hi: Int
+    // The low half of the interface identifier to ask for.
+    cfg_id_lo: Int
+    // The name PAP and CHAP present.
+    user: Vec[u8; 64]
+    // The secret PAP and CHAP present.
+    secret: Vec[u8; 64]
+    // What the peer asked in its Configure-Request, tentative until LCP opens:
+    // its MRU.
+    peer_mru: Int
+    // The peer's ACCM.
+    peer_accm: Int
+    // The authentication protocol the peer asked of this end: 0xC023, 0xC223
+    // or 0.
+    peer_auth: Int
+    // Whether the peer accepts compressed protocol fields.
+    peer_pfc: Bool
+    // Whether the peer accepts compressed address and control fields.
+    peer_acfc: Bool
+    // The peer's magic number, or 0.
+    peer_magic: Int
+    // The MRU in force for sending, bytes.
+    tx_mru: Int
+    // The ACCM in force for sending.
+    tx_accm: Int
+    // Whether sent protocol fields are compressed.
+    tx_pfc: Bool
+    // Whether sent address and control fields are left out.
+    tx_acfc: Bool
+    // The IPv4 address of this end, from IPCP.
+    ip_local: Int
+    // The IPv4 address of the peer.
+    ip_peer: Int
+    // The primary DNS address, or 0.
+    dns1: Int
+    // The secondary DNS address, or 0.
+    dns2: Int
+    // The high half of this end's interface identifier.
+    id6_local_hi: Int
+    // The low half of this end's interface identifier.
+    id6_local_lo: Int
+    // The high half of the peer's interface identifier.
+    id6_peer_hi: Int
+    // The low half of the peer's interface identifier.
+    id6_peer_lo: Int
+    // One of the `PPP_AUTH_` states.
+    auth_state: Int
+    // The identifier of the PAP request or the CHAP challenge in play.
+    auth_id: Int
+    // PAP requests sent.
+    auth_tries: Int
+    // Milliseconds since the last PAP request was sent.
+    auth_wait_ms: Int
+    // Echo-Requests sent.
+    echoes_sent: Int
+    // Echo-Replies taken.
+    echoes_recv: Int
+    // Replies replaced before they were sent.
+    tx_lost: Int
+
+// The wire protocol of a layer index.
+@tier(embedded)
+@no_alloc
+fn proto_of(l: Int) -> Int []
+    if l == PPP_L_LCP
+        return PPP_P_LCP
+    if l == PPP_L_IPCP
+        return PPP_P_IPCP
+    PPP_P_IPV6CP
+
+// A session before it is configured: no credentials, a magic number of
+// 0x6E6F766F, an ACCM of 0, no compression, no DNS, no IPv6.
+//
+// The magic number detects a loop-back and should differ from the peer's;
+// `sess_set_magic` sets one from the caller's source of randomness.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     let s = pppsess.sess_new()
+//     println("${s.phase} ${s.cfg_accm} ${s.fsm[0].state}")   // 0 0 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_new() -> PppSession []
+    var fsm: Vec[PppFsm; 3] = Vec.new()
+    var want: Vec[Vec[u8; 64]; 3] = Vec.new()
+    var naks_sent: Vec[Int; 3] = Vec.new()
+    var naks_got: Vec[Int; 3] = Vec.new()
+    for _i in 0..3
+        let _ = fsm.push(pppfsm.fsm_new())
+        var o: Vec[u8; 64] = Vec.new()
+        let _ = want.push(o)
+        let _ = naks_sent.push(0)
+        let _ = naks_got.push(0)
+    PppSession { rx: pppframe.rx_new(), out: Vec.new(), out_proto: 0, out_pending: false,
+                 phase: PPP_PH_DEAD, fsm: fsm, want: want, naks_sent: naks_sent, naks_got: naks_got,
+                 pend: 0, cfg_magic: 0x6E6F766F, cfg_accm: 0, cfg_pfc: false, cfg_acfc: false,
+                 cfg_dns: false, cfg_addr: 0, cfg_ipv6: false, cfg_id_hi: 0, cfg_id_lo: 0,
+                 user: Vec.new(), secret: Vec.new(), peer_mru: 1500, peer_accm: 0xFFFFFFFF,
+                 peer_auth: 0, peer_pfc: false, peer_acfc: false, peer_magic: 0, tx_mru: 1500,
+                 tx_accm: 0xFFFFFFFF, tx_pfc: false, tx_acfc: false, ip_local: 0, ip_peer: 0,
+                 dns1: 0, dns2: 0, id6_local_hi: 0, id6_local_lo: 0, id6_peer_hi: 0, id6_peer_lo: 0,
+                 auth_state: PPP_AUTH_NONE, auth_id: 0, auth_tries: 0, auth_wait_ms: 0,
+                 echoes_sent: 0, echoes_recv: 0, tx_lost: 0 }
+
+// Set the name and the secret that PAP and CHAP present, each cut to 64
+// bytes.  With no name set the session refuses to authenticate and rejects
+// the peer's authentication option.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     pppsess.sess_set_credentials(var s, "internet", "secret")
+//     println("${s.user.len()} ${s.secret.len()}")   // 8 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_set_credentials(var s: PppSession, user: Str, secret: Str) []
+    s.user.clear()
+    s.secret.clear()
+    for i in 0..str.len(user)
+        let _ = s.user.push(str.byte_at_or(user, i, 0) as u8)
+    for i in 0..str.len(secret)
+        let _ = s.secret.push(str.byte_at_or(secret, i, 0) as u8)
+
+// Set the magic number: 32 bits, nonzero, different at each end and at each
+// start.  A value of 0 leaves the option out and with it the loop-back check.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     pppsess.sess_set_magic(var s, 0x1A2B3C4D)
+//     println("${s.cfg_magic}")   // 439041101
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_set_magic(var s: PppSession, magic: Int) []
+    s.cfg_magic = magic & 0xFFFFFFFF
+
+// Set the ACCM this end asks the peer to honour when it sends: the control
+// characters it must escape.  The default is 0, no escapes beyond the flag
+// and the escape, which suits a modem that passes all eight bits.  A value of
+// 0xFFFFFFFF is the protocol default and is left out of the request.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     pppsess.sess_set_accm(var s, 0x000A0000)
+//     println("${s.cfg_accm}")   // 655360
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_set_accm(var s: PppSession, accm: Int) []
+    s.cfg_accm = accm & 0xFFFFFFFF
+
+// Ask to receive frames with the protocol field compressed (`pfc`) and with
+// the address and control fields left out (`acfc`).
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     pppsess.sess_set_compression(var s, true, true)
+//     println("${s.cfg_pfc} ${s.cfg_acfc}")   // true true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_set_compression(var s: PppSession, pfc: Bool, acfc: Bool) []
+    s.cfg_pfc = pfc
+    s.cfg_acfc = acfc
+
+// Ask IPCP for the primary and secondary DNS addresses (RFC 1877) and for
+// the IPv4 address `addr`; an address of 0 asks the peer to assign one.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     pppsess.sess_set_ip(var s, 0, true)
+//     println("${s.cfg_dns}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_set_ip(var s: PppSession, addr: Int, dns: Bool) []
+    s.cfg_addr = addr & 0xFFFFFFFF
+    s.cfg_dns = dns
+
+// Run IPv6CP (RFC 5072) with the interface identifier `hi`:`lo`, each half
+// 32 bits.  An identifier of 0:0 asks the peer to suggest one.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     pppsess.sess_set_ipv6(var s, true, 0x02005EFF, 0xFE000001)
+//     println("${s.cfg_ipv6}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_set_ipv6(var s: PppSession, on: Bool, hi: Int, lo: Int) []
+    s.cfg_ipv6 = on
+    s.cfg_id_hi = hi & 0xFFFFFFFF
+    s.cfg_id_lo = lo & 0xFFFFFFFF
+
+// Build the options each layer asks for from the configuration.
+@tier(embedded)
+@no_alloc
+fn build_wants(var s: PppSession) []
+    s.want[PPP_L_LCP].clear()
+    s.want[PPP_L_IPCP].clear()
+    s.want[PPP_L_IPV6CP].clear()
+    if s.cfg_accm != 0xFFFFFFFF
+        pppcp.opts_put32(var s.want[PPP_L_LCP], 2, s.cfg_accm)
+    if s.cfg_magic != 0
+        pppcp.opts_put32(var s.want[PPP_L_LCP], 5, s.cfg_magic)
+    if s.cfg_pfc
+        pppcp.opts_put0(var s.want[PPP_L_LCP], 7)
+    if s.cfg_acfc
+        pppcp.opts_put0(var s.want[PPP_L_LCP], 8)
+    pppcp.opts_put32(var s.want[PPP_L_IPCP], 3, s.cfg_addr)
+    if s.cfg_dns
+        pppcp.opts_put32(var s.want[PPP_L_IPCP], 129, 0)
+        pppcp.opts_put32(var s.want[PPP_L_IPCP], 131, 0)
+    pppcp.opts_put64(var s.want[PPP_L_IPV6CP], 1, s.cfg_id_hi, s.cfg_id_lo)
+
+// The framing options in force for sending.
+@tier(embedded)
+@no_alloc
+fn frame_opts(var s: PppSession) -> PppFrameOpts []
+    PppFrameOpts { accm: s.tx_accm, acfc: s.tx_acfc, pfc: s.tx_pfc, fcs32: false }
+
+// Put the parameters of the link back to the defaults of RFC 1661, as before
+// LCP has agreed anything.
+@tier(embedded)
+@no_alloc
+fn reset_link(var s: PppSession) []
+    s.peer_mru = 1500
+    s.peer_accm = 0xFFFFFFFF
+    s.peer_auth = 0
+    s.peer_pfc = false
+    s.peer_acfc = false
+    s.peer_magic = 0
+    s.tx_mru = 1500
+    s.tx_accm = 0xFFFFFFFF
+    s.tx_pfc = false
+    s.tx_acfc = false
+    pppframe.rx_set_accm(var s.rx, 0xFFFFFFFF)
+    s.auth_state = PPP_AUTH_NONE
+
+// ── The replies a frame is answered with ────────────────────────────
+
+// Begin a reply of `code` and `id` in `out` for layer `l`.  A reply that was
+// not taken is replaced, and counted.
+@tier(embedded)
+@no_alloc
+fn begin_reply(var s: PppSession, proto: Int, code: Int, id: Int) []
+    if s.out_pending
+        s.tx_lost = s.tx_lost + 1
+    s.out_proto = proto
+    pppcp.cp_begin(var s.out, code, id)
+
+// Mark the reply in `out` as ready to send.
+@tier(embedded)
+@no_alloc
+fn finish_reply(var s: PppSession) []
+    pppcp.cp_end(var s.out)
+    s.out_pending = true
+
+// The reply a Terminate-Request is answered with: a Terminate-Ack of the same
+// identifier.
+@tier(embedded)
+@no_alloc
+fn reply_term_ack(var s: PppSession, l: Int, id: Int) []
+    begin_reply(var s, proto_of(l), PPP_CP_TERM_ACK, id)
+    finish_reply(var s)
+
+// The reply an Echo-Request is answered with: an Echo-Reply holding this
+// end's magic number and the data of the request.
+@tier(embedded)
+@no_alloc
+fn reply_echo(var s: PppSession, id: Int) []
+    begin_reply(var s, PPP_P_LCP, PPP_CP_ECHO_REP, id)
+    pppcp.cp_put32(var s.out, s.cfg_magic)
+    let n = pppcp.cp_len(var s.rx.buf)
+    for i in 8..n
+        pppcp.cp_put8(var s.out, pppcp.get8(var s.rx.buf, i))
+    finish_reply(var s)
+
+// The reply an unknown code is answered with: a Code-Reject holding the
+// packet, cut to 128 bytes.
+@tier(embedded)
+@no_alloc
+fn reply_code_reject(var s: PppSession, l: Int) []
+    pppfsm.fsm_next_id(var s.fsm[l])
+    begin_reply(var s, proto_of(l), PPP_CP_CODE_REJ, s.fsm[l].id)
+    var n = s.rx.buf.len()
+    if n > 128
+        n = 128
+    for i in 0..n
+        pppcp.cp_put8(var s.out, pppcp.get8(var s.rx.buf, i))
+    finish_reply(var s)
+
+// The reply an unknown protocol is answered with: an LCP Protocol-Reject
+// holding the protocol and the start of the information.
+@tier(embedded)
+@no_alloc
+fn reply_protocol_reject(var s: PppSession) []
+    pppfsm.fsm_next_id(var s.fsm[PPP_L_LCP])
+    begin_reply(var s, PPP_P_LCP, PPP_CP_PROTO_REJ, s.fsm[PPP_L_LCP].id)
+    pppcp.cp_put16(var s.out, s.rx.proto)
+    var n = s.rx.buf.len()
+    if n > 120
+        n = 120
+    for i in 0..n
+        pppcp.cp_put8(var s.out, pppcp.get8(var s.rx.buf, i))
+    finish_reply(var s)
+
+// ── What the peer asks for ──────────────────────────────────────────
+
+// Whether the session has credentials to authenticate with.
+@tier(embedded)
+@no_alloc
+fn can_auth(var s: PppSession) -> Bool []
+    s.user.len() > 0
+
+// The verdict on the option at `pos` of the Configure-Request in `s.rx.buf`
+// for layer `l`: 0 to acknowledge it, 1 to suggest another value, 2 to
+// reject it.
+@tier(embedded)
+@no_alloc
+fn verdict_of(var s: PppSession, l: Int, pos: Int) -> Int []
+    let t = pppcp.get8(var s.rx.buf, pos)
+    let n = pppcp.opt_len_at(var s.rx.buf, pos)
+    if l == PPP_L_LCP
+        if t == 1
+            if n != 4
+                return 2
+            if pppcp.get16(var s.rx.buf, pos + 2) < 64
+                return 1
+            return 0
+        if t == 2
+            if n == 6
+                return 0
+            return 2
+        if t == 3
+            if n < 4 or not can_auth(var s)
+                return 2
+            let p = pppcp.get16(var s.rx.buf, pos + 2)
+            if p == PPP_P_PAP and n == 4
+                return 0
+            if p == PPP_P_CHAP and n == 5 and pppcp.get8(var s.rx.buf, pos + 4) == 5
+                return 0
+            return 1
+        if t == 5
+            if n != 6
+                return 2
+            let m = pppcp.get32(var s.rx.buf, pos + 2)
+            if m == s.cfg_magic and m != 0
+                return 1
+            return 0
+        if t == 7 or t == 8
+            if n == 2
+                return 0
+            return 2
+        return 2
+    if l == PPP_L_IPCP
+        if t == 3 and n == 6
+            return 0
+        return 2
+    if t == 1 and n == 10
+        let hi = pppcp.get32(var s.rx.buf, pos + 2)
+        let lo = pppcp.get32(var s.rx.buf, pos + 6)
+        if (hi == 0 and lo == 0) or (hi == s.id6_local_hi and lo == s.id6_local_lo)
+            return 1
+        if hi == s.cfg_id_hi and lo == s.cfg_id_lo
+            return 1
+        return 0
+    2
+
+// Write into `out` the option that suggests a value for the one at `pos` of
+// the request.
+@tier(embedded)
+@no_alloc
+fn suggest(var s: PppSession, l: Int, pos: Int) []
+    let t = pppcp.get8(var s.rx.buf, pos)
+    pppcp.cp_put8(var s.out, t)
+    if l == PPP_L_LCP
+        if t == 1
+            pppcp.cp_put8(var s.out, 4)
+            pppcp.cp_put16(var s.out, 1500)
+        elif t == 3
+            pppcp.cp_put8(var s.out, 5)
+            pppcp.cp_put16(var s.out, PPP_P_CHAP)
+            pppcp.cp_put8(var s.out, 5)
+        else
+            pppcp.cp_put8(var s.out, 6)
+            pppcp.cp_put32(var s.out, (s.cfg_magic ^ 0x5A5A5A5A) & 0xFFFFFFFF)
+    else
+        pppcp.cp_put8(var s.out, 10)
+        pppcp.cp_put32(var s.out, s.cfg_id_hi)
+        pppcp.cp_put32(var s.out, s.cfg_id_lo ^ 1)
+
+// Take the values of an acknowledged Configure-Request into the session.
+@tier(embedded)
+@no_alloc
+fn apply_peer(var s: PppSession, l: Int) []
+    if l == PPP_L_LCP
+        s.peer_mru = 1500
+        s.peer_accm = 0xFFFFFFFF
+        s.peer_auth = 0
+        s.peer_pfc = false
+        s.peer_acfc = false
+        s.peer_magic = 0
+    var pos = 4
+    for _i in 0..64
+        let n = pppcp.opt_len_at(var s.rx.buf, pos)
+        if n > 0
+            let t = pppcp.get8(var s.rx.buf, pos)
+            if l == PPP_L_LCP
+                if t == 1
+                    s.peer_mru = pppcp.get16(var s.rx.buf, pos + 2)
+                elif t == 2
+                    s.peer_accm = pppcp.get32(var s.rx.buf, pos + 2)
+                elif t == 3
+                    s.peer_auth = pppcp.get16(var s.rx.buf, pos + 2)
+                elif t == 5
+                    s.peer_magic = pppcp.get32(var s.rx.buf, pos + 2)
+                elif t == 7
+                    s.peer_pfc = true
+                elif t == 8
+                    s.peer_acfc = true
+            elif l == PPP_L_IPCP
+                s.ip_peer = pppcp.get32(var s.rx.buf, pos + 2)
+            else
+                s.id6_peer_hi = pppcp.get32(var s.rx.buf, pos + 2)
+                s.id6_peer_lo = pppcp.get32(var s.rx.buf, pos + 6)
+            pos = pos + n
+
+// Judge the Configure-Request in `s.rx.buf` for layer `l`, build the Ack, Nak
+// or Reject in `s.out`, and answer which: `PPP_CP_CONF_ACK`,
+// `PPP_CP_CONF_NAK` or `PPP_CP_CONF_REJ`.  A request with an option whose
+// length is wrong is answered with 0 and nothing is built.
+@tier(embedded)
+@no_alloc
+fn judge_request(var s: PppSession, l: Int) -> Int []
+    let end = pppcp.cp_len(var s.rx.buf)
+    var naks = 0
+    var rejs = 0
+    var pos = 4
+    for _i in 0..64
+        if pos < end
+            let n = pppcp.opt_len_at(var s.rx.buf, pos)
+            if n == 0
+                return 0
+            let v = verdict_of(var s, l, pos)
+            if v == 1
+                naks = naks + 1
+            elif v == 2
+                rejs = rejs + 1
+            pos = pos + n
+    if pos < end
+        return 0
+    let as_reject = s.naks_sent[l] >= PPP_MAX_FAILURE
+    var code = PPP_CP_CONF_ACK
+    if rejs > 0 or (naks > 0 and as_reject)
+        code = PPP_CP_CONF_REJ
+    elif naks > 0
+        code = PPP_CP_CONF_NAK
+    let id = pppcp.cp_id(var s.rx.buf)
+    begin_reply(var s, proto_of(l), code, id)
+    pos = 4
+    for _i in 0..64
+        if pos < end
+            let n = pppcp.opt_len_at(var s.rx.buf, pos)
+            let v = verdict_of(var s, l, pos)
+            if code == PPP_CP_CONF_ACK
+                pppcp.copy_opt(var s.out, var s.rx.buf, pos)
+            elif code == PPP_CP_CONF_REJ and v != 0
+                pppcp.copy_opt(var s.out, var s.rx.buf, pos)
+            elif code == PPP_CP_CONF_NAK and v == 1
+                suggest(var s, l, pos)
+            pos = pos + n
+    finish_reply(var s)
+    if code == PPP_CP_CONF_NAK
+        s.naks_sent[l] = s.naks_sent[l] + 1
+    elif code == PPP_CP_CONF_ACK
+        s.naks_sent[l] = 0
+    code
+
+// ── The layers ──────────────────────────────────────────────────────
+
+// Bring the network layers up: IPCP, and IPv6CP if enabled.
+@tier(embedded)
+@no_alloc
+fn start_ncps(var s: PppSession) -> Int []
+    s.phase = PPP_PH_NETWORK
+    var ev = layer_event(var s, PPP_L_IPCP, pppfsm.PPP_E_UP)
+    ev = ev | layer_event(var s, PPP_L_IPCP, pppfsm.PPP_E_OPEN)
+    if s.cfg_ipv6
+        ev = ev | layer_event(var s, PPP_L_IPV6CP, pppfsm.PPP_E_UP)
+        ev = ev | layer_event(var s, PPP_L_IPV6CP, pppfsm.PPP_E_OPEN)
+    ev
+
+// Layer `l` came up: the negotiation is finished.
+@tier(embedded)
+@no_alloc
+fn layer_up(var s: PppSession, l: Int) -> Int []
+    if l == PPP_L_LCP
+        s.tx_mru = s.peer_mru
+        s.tx_accm = s.peer_accm
+        s.tx_pfc = s.peer_pfc
+        s.tx_acfc = s.peer_acfc
+        let mine = pppcp.opts_get32(var s.want[PPP_L_LCP], 2, 0, 0xFFFFFFFF)
+        pppframe.rx_set_accm(var s.rx, mine)
+        if s.peer_auth == 0
+            return PPP_EV_LINK_UP | start_ncps(var s)
+        s.phase = PPP_PH_AUTH
+        s.auth_state = PPP_AUTH_WAITING
+        s.auth_tries = 0
+        s.auth_wait_ms = 0
+        if s.peer_auth == PPP_P_PAP
+            s.pend = s.pend | PEND_PAP
+        return PPP_EV_LINK_UP
+    if l == PPP_L_IPCP
+        s.ip_local = pppcp.opts_get32(var s.want[PPP_L_IPCP], 3, 0, 0)
+        s.dns1 = pppcp.opts_get32(var s.want[PPP_L_IPCP], 129, 0, 0)
+        s.dns2 = pppcp.opts_get32(var s.want[PPP_L_IPCP], 131, 0, 0)
+        return PPP_EV_IPCP_UP
+    s.id6_local_hi = pppcp.opts_get32(var s.want[PPP_L_IPV6CP], 1, 0, 0)
+    s.id6_local_lo = pppcp.opts_get32(var s.want[PPP_L_IPV6CP], 1, 4, 0)
+    PPP_EV_IPV6CP_UP
+
+// Layer `l` went down: it left the Opened state or lost the layer below.
+@tier(embedded)
+@no_alloc
+fn layer_down(var s: PppSession, l: Int) -> Int []
+    if l == PPP_L_IPCP
+        return PPP_EV_IPCP_DOWN
+    if l == PPP_L_IPV6CP
+        return PPP_EV_IPV6CP_DOWN
+    let st = s.fsm[PPP_L_LCP].state
+    if st == pppfsm.PPP_S_CLOSING or st == pppfsm.PPP_S_STOPPING
+        s.phase = PPP_PH_TERMINATE
+    elif st <= pppfsm.PPP_S_STARTING
+        s.phase = PPP_PH_DEAD
+    else
+        s.phase = PPP_PH_ESTABLISH
+    reset_link(var s)
+    var ev = PPP_EV_LINK_DOWN
+    ev = ev | layer_event(var s, PPP_L_IPCP, pppfsm.PPP_E_DOWN)
+    ev = ev | layer_event(var s, PPP_L_IPV6CP, pppfsm.PPP_E_DOWN)
+    ev
+
+// Layer `l` is finished: it will not come up without a new Open.
+@tier(embedded)
+@no_alloc
+fn layer_finished(var s: PppSession, l: Int) -> Int []
+    if l == PPP_L_LCP
+        s.phase = PPP_PH_DEAD
+        return PPP_EV_CLOSED
+    PPP_EV_NCP_FAILED
+
+// Queue the Configure-Request of layer `l`, with a new identifier unless the
+// timer is repeating the last.
+@tier(embedded)
+@no_alloc
+fn queue_request(var s: PppSession, l: Int) []
+    if not s.fsm[l].retransmit
+        pppfsm.fsm_next_id(var s.fsm[l])
+    s.pend = s.pend | (1 << (2 * l))
+
+// Queue the Terminate-Request of layer `l`.
+@tier(embedded)
+@no_alloc
+fn queue_terminate(var s: PppSession, l: Int) []
+    if not s.fsm[l].retransmit
+        pppfsm.fsm_next_id(var s.fsm[l])
+    s.pend = (s.pend & (0xFFFF ^ (1 << (2 * l)))) | (1 << (2 * l + 1))
+
+// Carry out the actions the automaton of layer `l` asked for, and answer the
+// events they cause.
+@tier(embedded)
+@no_alloc
+fn run_actions(var s: PppSession, l: Int, acts: Int) -> Int []
+    var ev = 0
+    if (acts & pppfsm.PPP_A_TLD) != 0
+        ev = ev | layer_down(var s, l)
+    if (acts & pppfsm.PPP_A_TLU) != 0
+        ev = ev | layer_up(var s, l)
+    if (acts & pppfsm.PPP_A_TLF) != 0
+        ev = ev | layer_finished(var s, l)
+    if (acts & pppfsm.PPP_A_SCR) != 0
+        queue_request(var s, l)
+    if (acts & pppfsm.PPP_A_STR) != 0
+        queue_terminate(var s, l)
+    ev
+
+// Make `event` happen to layer `l` and carry out its actions.
+@tier(embedded)
+@no_alloc
+fn layer_event(var s: PppSession, l: Int, event: Int) -> Int []
+    let acts = pppfsm.fsm_event(var s.fsm[l], event)
+    run_actions(var s, l, acts)
+
+// ── The control packets of a layer ───────────────────────────────────
+
+// Take the values a Configure-Nak suggests into the layer's options.
+@tier(embedded)
+@no_alloc
+fn take_nak(var s: PppSession, l: Int) []
+    var pos = 4
+    for _i in 0..64
+        let n = pppcp.opt_len_at(var s.rx.buf, pos)
+        if n > 0
+            let t = pppcp.get8(var s.rx.buf, pos)
+            var fresh = pppcp.opts_adopt(var s.want[l], t, var s.rx.buf, pos)
+            if fresh and l == PPP_L_LCP and t == 5
+                s.cfg_magic = pppcp.opts_get32(var s.want[l], 5, 0, s.cfg_magic)
+            pos = pos + n
+
+// Whether every option of the Configure-Reject in `s.rx.buf` is one the layer
+// sent, byte for byte.
+@tier(embedded)
+@no_alloc
+fn reject_is_valid(var s: PppSession, l: Int) -> Bool []
+    var pos = 4
+    let end = pppcp.cp_len(var s.rx.buf)
+    var ok = true
+    for _i in 0..64
+        if pos < end
+            let n = pppcp.opt_len_at(var s.rx.buf, pos)
+            if n == 0 or not pppcp.opts_has(var s.want[l], var s.rx.buf, pos)
+                ok = false
+                pos = end
+            else
+                pos = pos + n
+    ok
+
+// Take the options of a Configure-Reject out of the layer's list.
+@tier(embedded)
+@no_alloc
+fn take_reject(var s: PppSession, l: Int) []
+    var pos = 4
+    let end = pppcp.cp_len(var s.rx.buf)
+    for _i in 0..64
+        if pos < end
+            let n = pppcp.opt_len_at(var s.rx.buf, pos)
+            if n > 0
+                pppcp.opts_remove(var s.want[l], pppcp.get8(var s.rx.buf, pos))
+                pos = pos + n
+            else
+                pos = end
+
+// A Configure-Nak or Configure-Reject has been taken `PPP_MAX_NAKS_RECEIVED`
+// times in a row: the peer will not agree.
+@tier(embedded)
+@no_alloc
+fn count_nak(var s: PppSession, l: Int) -> Bool []
+    s.naks_got[l] = s.naks_got[l] + 1
+    s.naks_got[l] > PPP_MAX_NAKS_RECEIVED
+
+// The Protocol-Reject for `proto` arrived: which layer's automaton gets the
+// fatal event.
+@tier(embedded)
+@no_alloc
+fn handle_protocol_reject(var s: PppSession) -> Int []
+    let rejected = pppcp.get16(var s.rx.buf, 4)
+    var ev = 0
+    if rejected == PPP_P_IPCP
+        ev = ev | layer_event(var s, PPP_L_IPCP, pppfsm.PPP_E_RXJ_MINUS)
+    elif rejected == PPP_P_IPV6CP
+        ev = ev | layer_event(var s, PPP_L_IPV6CP, pppfsm.PPP_E_RXJ_MINUS)
+    if rejected == PPP_P_LCP or rejected == PPP_P_PAP or rejected == PPP_P_CHAP
+        return ev | layer_event(var s, PPP_L_LCP, pppfsm.PPP_E_RXJ_MINUS)
+    ev | layer_event(var s, PPP_L_LCP, pppfsm.PPP_E_RXJ_PLUS)
+
+// Handle the control packet in `s.rx.buf` for layer `l`.
+@tier(embedded)
+@no_alloc
+fn handle_cp(var s: PppSession, l: Int) -> Int []
+    if not pppcp.cp_valid(var s.rx.buf)
+        return 0
+    let code = pppcp.cp_code(var s.rx.buf)
+    let id = pppcp.cp_id(var s.rx.buf)
+    if code == PPP_CP_CONF_REQ
+        let v = judge_request(var s, l)
+        if v == 0
+            return 0
+        var event = pppfsm.PPP_E_RCR_MINUS
+        if v == PPP_CP_CONF_ACK
+            event = pppfsm.PPP_E_RCR_PLUS
+        let acts = pppfsm.fsm_event(var s.fsm[l], event)
+        if (acts & pppfsm.PPP_A_SCA) != 0
+            apply_peer(var s, l)
+        if (acts & (pppfsm.PPP_A_SCA | pppfsm.PPP_A_SCN)) == 0
+            s.out_pending = false
+            if (acts & pppfsm.PPP_A_STA) != 0
+                reply_term_ack(var s, l, id)
+        return run_actions(var s, l, acts)
+    if code == PPP_CP_CONF_ACK
+        if id != s.fsm[l].id or not pppcp.opts_equal(var s.want[l], var s.rx.buf)
+            return 0
+        s.naks_got[l] = 0
+        return layer_event(var s, l, pppfsm.PPP_E_RCA)
+    if code == PPP_CP_CONF_NAK or code == PPP_CP_CONF_REJ
+        if id != s.fsm[l].id
+            return 0
+        if code == PPP_CP_CONF_REJ and not reject_is_valid(var s, l)
+            return 0
+        if code == PPP_CP_CONF_NAK
+            take_nak(var s, l)
+        else
+            take_reject(var s, l)
+        if count_nak(var s, l)
+            s.naks_got[l] = 0
+            return layer_event(var s, l, pppfsm.PPP_E_RXJ_MINUS)
+        return layer_event(var s, l, pppfsm.PPP_E_RCN)
+    if code == PPP_CP_TERM_REQ
+        let acts = pppfsm.fsm_event(var s.fsm[l], pppfsm.PPP_E_RTR)
+        if (acts & pppfsm.PPP_A_STA) != 0
+            reply_term_ack(var s, l, id)
+        return run_actions(var s, l, acts)
+    if code == PPP_CP_TERM_ACK
+        return layer_event(var s, l, pppfsm.PPP_E_RTA)
+    if code == PPP_CP_CODE_REJ
+        let rejected = pppcp.get8(var s.rx.buf, 4)
+        if rejected >= 1 and rejected <= 7
+            return layer_event(var s, l, pppfsm.PPP_E_RXJ_MINUS)
+        return layer_event(var s, l, pppfsm.PPP_E_RXJ_PLUS)
+    if l == PPP_L_LCP and code == PPP_CP_PROTO_REJ
+        return handle_protocol_reject(var s)
+    if l == PPP_L_LCP and code >= PPP_CP_ECHO_REQ and code <= PPP_CP_DISCARD_REQ
+        let acts = pppfsm.fsm_event(var s.fsm[l], pppfsm.PPP_E_RXR)
+        if code == PPP_CP_ECHO_REP
+            s.echoes_recv = s.echoes_recv + 1
+        if (acts & pppfsm.PPP_A_SER) != 0 and code == PPP_CP_ECHO_REQ
+            reply_echo(var s, id)
+        return run_actions(var s, l, acts)
+    let acts = pppfsm.fsm_event(var s.fsm[l], pppfsm.PPP_E_RUC)
+    if (acts & pppfsm.PPP_A_SCJ) != 0
+        reply_code_reject(var s, l)
+    run_actions(var s, l, acts)
+
+// ── Authentication ───────────────────────────────────────────────────
+
+// The peer accepted the credentials: the network phase begins.
+@tier(embedded)
+@no_alloc
+fn auth_succeeded(var s: PppSession) -> Int []
+    if s.auth_state != PPP_AUTH_WAITING
+        return 0
+    s.auth_state = PPP_AUTH_OK
+    PPP_EV_AUTH_OK | start_ncps(var s)
+
+// The peer refused the credentials: close the link.
+@tier(embedded)
+@no_alloc
+fn auth_failed(var s: PppSession) -> Int []
+    if s.auth_state != PPP_AUTH_WAITING
+        return 0
+    s.auth_state = PPP_AUTH_FAILED
+    PPP_EV_AUTH_FAILED | layer_event(var s, PPP_L_LCP, pppfsm.PPP_E_CLOSE)
+
+// The CHAP response to the challenge in `s.rx.buf`: the identifier, a value
+// of 16 bytes that is the MD5 of the identifier, the secret and the
+// challenge, and the name.
+@tier(embedded)
+@no_alloc
+fn reply_chap_response(var s: PppSession) []
+    let id = pppcp.cp_id(var s.rx.buf)
+    let size = pppcp.get8(var s.rx.buf, 4)
+    var m = pppmd5.md5_new()
+    pppmd5.md5_byte(var m, id)
+    for i in 0..s.secret.len()
+        pppmd5.md5_byte(var m, s.secret[i] as Int)
+    for i in 0..size
+        pppmd5.md5_byte(var m, pppcp.get8(var s.rx.buf, 5 + i))
+    var d: pppmd5.Md5Digest = Vec.new()
+    pppmd5.md5_finish(var m, var d)
+    begin_reply(var s, PPP_P_CHAP, 2, id)
+    pppcp.cp_put8(var s.out, 16)
+    for i in 0..16
+        pppcp.cp_put8(var s.out, d[i] as Int)
+    for i in 0..s.user.len()
+        pppcp.cp_put8(var s.out, s.user[i] as Int)
+    finish_reply(var s)
+
+// Handle a CHAP packet.
+@tier(embedded)
+@no_alloc
+fn handle_chap(var s: PppSession) -> Int []
+    if s.fsm[PPP_L_LCP].state != pppfsm.PPP_S_OPENED or s.peer_auth != PPP_P_CHAP
+        return 0
+    if not pppcp.cp_valid(var s.rx.buf)
+        return 0
+    let code = pppcp.cp_code(var s.rx.buf)
+    let id = pppcp.cp_id(var s.rx.buf)
+    if code == 1
+        let size = pppcp.get8(var s.rx.buf, 4)
+        if size < 1 or 5 + size > pppcp.cp_len(var s.rx.buf)
+            return 0
+        s.auth_id = id
+        reply_chap_response(var s)
+        return 0
+    if id != s.auth_id
+        return 0
+    if code == 3
+        return auth_succeeded(var s)
+    if code == 4
+        return auth_failed(var s)
+    0
+
+// Handle a PAP packet.
+@tier(embedded)
+@no_alloc
+fn handle_pap(var s: PppSession) -> Int []
+    if s.fsm[PPP_L_LCP].state != pppfsm.PPP_S_OPENED or s.peer_auth != PPP_P_PAP
+        return 0
+    if not pppcp.cp_valid(var s.rx.buf) or pppcp.cp_id(var s.rx.buf) != s.auth_id
+        return 0
+    let code = pppcp.cp_code(var s.rx.buf)
+    if code == 2
+        return auth_succeeded(var s)
+    if code == 3
+        return auth_failed(var s)
+    0
+
+// Build the PAP Authenticate-Request in `out`, with a new identifier.
+@tier(embedded)
+@no_alloc
+fn build_pap_request(var s: PppSession) []
+    s.auth_id = (s.auth_id + 1) & 0xFF
+    s.auth_tries = s.auth_tries + 1
+    s.auth_wait_ms = 0
+    pppcp.cp_begin(var s.out, 1, s.auth_id)
+    pppcp.cp_put8(var s.out, s.user.len())
+    for i in 0..s.user.len()
+        pppcp.cp_put8(var s.out, s.user[i] as Int)
+    pppcp.cp_put8(var s.out, s.secret.len())
+    for i in 0..s.secret.len()
+        pppcp.cp_put8(var s.out, s.secret[i] as Int)
+    pppcp.cp_end(var s.out)
+
+// ── The session ──────────────────────────────────────────────────────
+
+// Start the link: the serial port is in data mode, the lower layer is up, and
+// this end asks to open.  Answers the events that caused; the Configure-Request
+// is queued for `sess_tx`.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     let ev = pppsess.sess_start(var s)
+//     println("${ev} ${s.phase} ${s.fsm[0].state}")   // 0 1 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_start(var s: PppSession) -> Int []
+    build_wants(var s)
+    reset_link(var s)
+    s.pend = 0
+    s.out_pending = false
+    pppframe.rx_reset(var s.rx)
+    s.phase = PPP_PH_ESTABLISH
+    var ev = layer_event(var s, PPP_L_LCP, pppfsm.PPP_E_UP)
+    ev | layer_event(var s, PPP_L_LCP, pppfsm.PPP_E_OPEN)
+
+// Ask to close the link: the network layers go down, and a Terminate-Request
+// is queued.  `PPP_EV_CLOSED` follows when the peer answers or the timer gives
+// up.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     let _ = pppsess.sess_start(var s)
+//     let ev = pppsess.sess_close(var s)
+//     println("${ev} ${s.phase} ${s.fsm[0].state}")   // 0 4 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_close(var s: PppSession) -> Int []
+    let ev = layer_event(var s, PPP_L_LCP, pppfsm.PPP_E_CLOSE)
+    if s.fsm[PPP_L_LCP].state == pppfsm.PPP_S_CLOSING
+        s.phase = PPP_PH_TERMINATE
+    ev
+
+// The lower layer went down: the carrier dropped, or the module said `NO
+// CARRIER`.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     let _ = pppsess.sess_start(var s)
+//     let _ = pppsess.sess_lower_down(var s)
+//     println("${s.phase} ${s.fsm[0].state}")   // 0 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_lower_down(var s: PppSession) -> Int []
+    s.pend = 0
+    s.out_pending = false
+    let ev = layer_event(var s, PPP_L_LCP, pppfsm.PPP_E_DOWN)
+    s.phase = PPP_PH_DEAD
+    ev
+
+// Queue an LCP Echo-Request, the keep-alive of the link.  Whether the peer
+// answers is for the caller to watch in `echoes_recv`.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     pppsess.sess_echo(var s)
+//     println("${s.pend}")   // 128
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_echo(var s: PppSession) []
+    s.pend = s.pend | PEND_ECHO
+
+// Send a datagram in the protocol `proto` (`PPP_P_IP` or `PPP_P_IPV6`),
+// framed with the options in force, appended to `wire`.  Answers false when
+// the network layer is not open, when the datagram is longer than the peer's
+// MRU, or when it does not fit.
+//
+// ```novo
+// use pppframe
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     var d: pppframe.PppInfo = Vec.new()
+//     let _ = d.push(0x45)
+//     var w: pppframe.PppWire = Vec.new()
+//     println("${pppsess.sess_send(var s, pppframe.PPP_P_IP, var d, var w)}")   // false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_send(var s: PppSession, proto: Int, var info: PppInfo, var wire: PppWire) -> Bool []
+    var l = PPP_L_IPV6CP
+    if proto == PPP_P_IP
+        l = PPP_L_IPCP
+    elif proto != PPP_P_IPV6
+        return false
+    if s.fsm[l].state != pppfsm.PPP_S_OPENED or info.len() > s.tx_mru
+        return false
+    let o = frame_opts(var s)
+    pppframe.frame_encode(proto, var info, o, var wire)
+
+// Append the next frame the session has to send to `wire` and answer whether
+// there was one.  The reply to the last frame goes first, then the
+// Terminate-Requests, the Configure-Requests, the PAP request and the
+// Echo-Request.  Call it until it answers false.
+//
+// ```novo
+// use pppframe
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     let _ = pppsess.sess_start(var s)
+//     var w: pppframe.PppWire = Vec.new()
+//     let first = pppsess.sess_tx(var s, var w)
+//     let second = pppsess.sess_tx(var s, var w)
+//     println("${first} ${second} ${w.len()}")   // true false 38
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_tx(var s: PppSession, var wire: PppWire) -> Bool []
+    let o = frame_opts(var s)
+    if s.out_pending
+        let ok = pppframe.frame_encode(s.out_proto, var s.out, o, var wire)
+        if ok
+            s.out_pending = false
+        return ok
+    var proto = 0
+    var sent = 0
+    for l in 0..3
+        if proto == 0 and (s.pend & (1 << (2 * l + 1))) != 0
+            pppcp.cp_begin(var s.out, PPP_CP_TERM_REQ, s.fsm[l].id)
+            pppcp.cp_end(var s.out)
+            proto = proto_of(l)
+            sent = 1 << (2 * l + 1)
+        if proto == 0 and (s.pend & (1 << (2 * l))) != 0
+            let id = s.fsm[l].id
+            pppcp.opts_packet(var s.want[l], var s.out, PPP_CP_CONF_REQ, id)
+            proto = proto_of(l)
+            sent = 1 << (2 * l)
+    if proto == 0 and (s.pend & PEND_PAP) != 0
+        build_pap_request(var s)
+        proto = PPP_P_PAP
+        sent = PEND_PAP
+    if proto == 0 and (s.pend & PEND_ECHO) != 0
+        let id = (s.fsm[PPP_L_LCP].id + 1) & 0xFF
+        pppcp.cp_begin(var s.out, PPP_CP_ECHO_REQ, id)
+        pppcp.cp_put32(var s.out, s.cfg_magic)
+        pppcp.cp_end(var s.out)
+        proto = PPP_P_LCP
+        sent = PEND_ECHO
+    if proto == 0
+        return false
+    let ok = pppframe.frame_encode(proto, var s.out, o, var wire)
+    if ok
+        s.pend = s.pend & (0xFFFF ^ sent)
+        if sent == PEND_ECHO
+            pppfsm.fsm_next_id(var s.fsm[PPP_L_LCP])
+            s.echoes_sent = s.echoes_sent + 1
+    ok
+
+// Act on the frame the receiver just delivered.
+@tier(embedded)
+@no_alloc
+fn dispatch(var s: PppSession) -> Int []
+    if s.fsm[PPP_L_LCP].state < pppfsm.PPP_S_CLOSED
+        return 0
+    let proto = s.rx.proto
+    if proto == PPP_P_LCP
+        return handle_cp(var s, PPP_L_LCP)
+    if s.fsm[PPP_L_LCP].state != pppfsm.PPP_S_OPENED
+        return 0
+    if proto == PPP_P_PAP
+        return handle_pap(var s)
+    if proto == PPP_P_CHAP
+        return handle_chap(var s)
+    if s.phase != PPP_PH_NETWORK
+        return 0
+    if proto == PPP_P_IPCP
+        return handle_cp(var s, PPP_L_IPCP)
+    if proto == PPP_P_IPV6CP and s.cfg_ipv6
+        return handle_cp(var s, PPP_L_IPV6CP)
+    if proto == PPP_P_IP and s.fsm[PPP_L_IPCP].state == pppfsm.PPP_S_OPENED
+        return PPP_EV_IP_PACKET
+    if proto == PPP_P_IPV6 and s.fsm[PPP_L_IPV6CP].state == pppfsm.PPP_S_OPENED
+        return PPP_EV_IPV6_PACKET
+    if proto == PPP_P_IP or proto == PPP_P_IPV6
+        return 0
+    reply_protocol_reject(var s)
+    0
+
+// Give the session one byte from the serial port and answer the events it
+// caused, as a mask of `PPP_EV_` bits.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     let _ = pppsess.sess_start(var s)
+//     // A stray byte is not a frame.
+//     println("${pppsess.sess_rx_byte(var s, 0x41)}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_rx_byte(var s: PppSession, b: Int) -> Int []
+    let r = pppframe.rx_byte(var s.rx, b)
+    if r == pppframe.PPP_RX_NONE
+        return 0
+    if r != pppframe.PPP_RX_FRAME
+        return PPP_EV_FRAME_ERROR
+    dispatch(var s)
+
+// Let `ms` milliseconds pass and answer the events that caused: a request
+// sent again, a layer that gave up, a PAP request that went unanswered.
+//
+// ```novo
+// use pppsess
+//
+// fn main() [io]
+//     var s = pppsess.sess_new()
+//     let _ = pppsess.sess_start(var s)
+//     let ev = pppsess.sess_tick(var s, 3000)
+//     println("${ev} ${s.pend}")   // 0 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn sess_tick(var s: PppSession, ms: Int) -> Int []
+    var ev = 0
+    for l in 0..3
+        let acts = pppfsm.fsm_tick(var s.fsm[l], ms)
+        if acts != 0
+            ev = ev | run_actions(var s, l, acts)
+    if s.auth_state == PPP_AUTH_WAITING and s.peer_auth == PPP_P_PAP and ms > 0
+        s.auth_wait_ms = s.auth_wait_ms + ms
+        if s.auth_wait_ms >= pppfsm.PPP_RESTART_MS
+            if s.auth_tries >= pppfsm.PPP_MAX_CONFIGURE
+                ev = ev | auth_failed(var s)
+            else
+                s.pend = s.pend | PEND_PAP
+                s.auth_wait_ms = 0
+    ev

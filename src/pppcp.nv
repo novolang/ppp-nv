@@ -1,0 +1,612 @@
+// pppcp.nv — the packets of the control protocols and the lists of their
+// options, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  LCP, IPCP and IPv6CP
+// share one packet format, RFC 1661 section 5:
+//
+//   code (1)  identifier (1)  length (2)  data ...
+//
+// The length counts the code, the identifier, the length and the data, and
+// bytes after it are padding to be ignored.  In a Configure-Request,
+// Configure-Ack, Configure-Nak and Configure-Reject the data is a run of
+// options, each of them
+//
+//   type (1)  length (1)  value ...
+//
+// where the length counts the type, the length and the value.  The packet is
+// the information field of a PPP frame, so it is built in and read from a
+// `PppInfo`.  PAP and CHAP use the same first four bytes with other codes.
+//
+// The list of options a session wants to send is kept as the bytes of the
+// options themselves, in a `PppOpts` of at most 64 bytes, which is the data
+// of its Configure-Request.  The helpers here find an option in a list, add
+// one, take one out, and overwrite its value with the one a Configure-Nak
+// suggests.  A list that would pass 64 bytes refuses the option, and the
+// options this package negotiates take 24 bytes at most.
+//
+// Reading is bounds-checked and answers 0 outside the packet, so a packet
+// that lies about its length cannot read past the buffer.
+
+use pppframe
+
+// Code 1: Configure-Request.
+pub const PPP_CP_CONF_REQ = 1
+// Code 2: Configure-Ack.
+pub const PPP_CP_CONF_ACK = 2
+// Code 3: Configure-Nak.
+pub const PPP_CP_CONF_NAK = 3
+// Code 4: Configure-Reject.
+pub const PPP_CP_CONF_REJ = 4
+// Code 5: Terminate-Request.
+pub const PPP_CP_TERM_REQ = 5
+// Code 6: Terminate-Ack.
+pub const PPP_CP_TERM_ACK = 6
+// Code 7: Code-Reject.
+pub const PPP_CP_CODE_REJ = 7
+// Code 8: Protocol-Reject (LCP only).
+pub const PPP_CP_PROTO_REJ = 8
+// Code 9: Echo-Request (LCP only).
+pub const PPP_CP_ECHO_REQ = 9
+// Code 10: Echo-Reply (LCP only).
+pub const PPP_CP_ECHO_REP = 10
+// Code 11: Discard-Request (LCP only).
+pub const PPP_CP_DISCARD_REQ = 11
+
+// The most bytes of options a list holds: 64.
+pub const PPP_OPTS_MAX = 64
+
+// A list of options, the data of a Configure-Request.
+pub alias PppOpts = Vec[u8; 64]
+
+// Start a control packet in `p`, which is emptied first: the code, the
+// identifier, and a length of 4 that `cp_end` corrects.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, pppcp.PPP_CP_ECHO_REQ, 7)
+//     pppcp.cp_put32(var p, 0x12345678)
+//     pppcp.cp_end(var p)
+//     println("${p.len()} ${pppcp.cp_len(var p)} ${pppcp.cp_id(var p)}")   // 8 8 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_begin(var p: PppInfo, code: Int, id: Int) []
+    p.clear()
+    let _ = p.push((code & 0xFF) as u8)
+    let _ = p.push((id & 0xFF) as u8)
+    let _ = p.push(0)
+    let _ = p.push(4)
+
+// Append one byte to a packet.  A packet that is full takes nothing.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 1, 1)
+//     pppcp.cp_put8(var p, 0x05)
+//     println("${p.len()}")   // 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_put8(var p: PppInfo, v: Int) []
+    let _ = p.push((v & 0xFF) as u8)
+
+// Append a 16-bit number, high byte first.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 1, 1)
+//     pppcp.cp_put16(var p, 0x05DC)
+//     println("${p[4]} ${p[5]}")   // 5 220
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_put16(var p: PppInfo, v: Int) []
+    cp_put8(var p, v >> 8)
+    cp_put8(var p, v)
+
+// Append a 32-bit number, high byte first.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 1, 1)
+//     pppcp.cp_put32(var p, 0xC0A80001)
+//     println("${p[4]} ${p[7]}")   // 192 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_put32(var p: PppInfo, v: Int) []
+    cp_put16(var p, v >> 16)
+    cp_put16(var p, v)
+
+// Write the packet's length into its header: the number of bytes it holds.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 1, 1)
+//     pppcp.cp_put8(var p, 1)
+//     pppcp.cp_end(var p)
+//     println("${p[2]} ${p[3]}")   // 0 5
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_end(var p: PppInfo) []
+    p[2] = ((p.len() >> 8) & 0xFF) as u8
+    p[3] = (p.len() & 0xFF) as u8
+
+// Byte `i` of a packet, or 0 outside it.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 9, 3)
+//     println("${pppcp.get8(var p, 0)} ${pppcp.get8(var p, 99)}")   // 9 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn get8(var p: PppInfo, i: Int) -> Int []
+    if i < 0 or i >= p.len()
+        return 0
+    p[i] as Int
+
+// The 16-bit number at `i`, high byte first, 0 for a byte outside the packet.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 1, 1)
+//     pppcp.cp_put16(var p, 0xC223)
+//     println("${pppcp.get16(var p, 4)}")   // 49699
+// ```
+pub @tier(embedded)
+@no_alloc
+fn get16(var p: PppInfo, i: Int) -> Int []
+    (get8(var p, i) << 8) | get8(var p, i + 1)
+
+// The 32-bit number at `i`, high byte first.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 1, 1)
+//     pppcp.cp_put32(var p, 0x0A000001)
+//     println("${pppcp.get32(var p, 4)}")   // 167772161
+// ```
+pub @tier(embedded)
+@no_alloc
+fn get32(var p: PppInfo, i: Int) -> Int []
+    (get16(var p, i) << 16) | get16(var p, i + 2)
+
+// The code of a packet.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 6, 2)
+//     println("${pppcp.cp_code(var p)}")   // 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_code(var p: PppInfo) -> Int []
+    get8(var p, 0)
+
+// The identifier of a packet.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 6, 2)
+//     println("${pppcp.cp_id(var p)}")   // 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_id(var p: PppInfo) -> Int []
+    get8(var p, 1)
+
+// The length a packet declares for itself.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 6, 2)
+//     println("${pppcp.cp_len(var p)}")   // 4
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_len(var p: PppInfo) -> Int []
+    get16(var p, 2)
+
+// Whether the packet is well formed: a header of four bytes, and a declared
+// length that is at least 4 and no more than the bytes held.  Bytes after the
+// declared length are padding.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 6, 2)
+//     let a = pppcp.cp_valid(var p)
+//     p[3] = 9
+//     println("${a} ${pppcp.cp_valid(var p)}")   // true false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn cp_valid(var p: PppInfo) -> Bool []
+    if p.len() < 4
+        return false
+    let n = cp_len(var p)
+    n >= 4 and n <= p.len()
+
+// The length of the option at `pos` in the packet, or 0 when there is no
+// well-formed option there: it must start inside the declared length, have a
+// length of at least 2, and end inside it.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 1, 1)
+//     pppcp.cp_put8(var p, 1)
+//     pppcp.cp_put8(var p, 4)
+//     pppcp.cp_put16(var p, 1500)
+//     pppcp.cp_end(var p)
+//     println("${pppcp.opt_len_at(var p, 4)} ${pppcp.opt_len_at(var p, 8)}")   // 4 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opt_len_at(var p: PppInfo, pos: Int) -> Int []
+    let end = cp_len(var p)
+    if pos < 4 or pos + 2 > end
+        return 0
+    let n = get8(var p, pos + 1)
+    if n < 2 or pos + n > end
+        return 0
+    n
+
+// Append the option at `pos` of `src`, whole, to `p`.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var a: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var a, 1, 1)
+//     pppcp.cp_put8(var a, 7)
+//     pppcp.cp_put8(var a, 2)
+//     pppcp.cp_end(var a)
+//     var b: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var b, 4, 1)
+//     pppcp.copy_opt(var b, var a, 4)
+//     pppcp.cp_end(var b)
+//     println("${pppcp.cp_len(var b)} ${b[4]}")   // 6 7
+// ```
+pub @tier(embedded)
+@no_alloc
+fn copy_opt(var p: PppInfo, var src: PppInfo, pos: Int) []
+    let n = opt_len_at(var src, pos)
+    for i in 0..n
+        cp_put8(var p, get8(var src, pos + i))
+
+// ── Lists of options ──────────────────────────────────────────────
+
+// The position of the first option of type `t` in the list, or -1.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put32(var o, 3, 0)
+//     println("${pppcp.opts_find(var o, 3)} ${pppcp.opts_find(var o, 129)}")   // 0 -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_find(var o: PppOpts, t: Int) -> Int []
+    var pos = 0
+    for _i in 0..PPP_OPTS_MAX
+        if pos + 2 <= o.len()
+            if (o[pos] as Int) == t
+                return pos
+            let n = o[pos + 1] as Int
+            if n < 2
+                return -1
+            pos = pos + n
+    -1
+
+// Append an option of type `t` with a value of two bytes.  A list that
+// would pass its limit takes nothing.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put16(var o, 1, 1500)
+//     println("${o.len()} ${o[2]} ${o[3]}")   // 4 5 220
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_put16(var o: PppOpts, t: Int, v: Int) []
+    if o.len() + 4 <= PPP_OPTS_MAX
+        let _ = o.push(t as u8)
+        let _ = o.push(4)
+        let _ = o.push(((v >> 8) & 0xFF) as u8)
+        let _ = o.push((v & 0xFF) as u8)
+
+// Append an option of type `t` with a value of four bytes.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put32(var o, 5, 0xA1B2C3D4)
+//     println("${o.len()} ${o[2]} ${o[5]}")   // 6 161 212
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_put32(var o: PppOpts, t: Int, v: Int) []
+    if o.len() + 6 <= PPP_OPTS_MAX
+        let _ = o.push(t as u8)
+        let _ = o.push(6)
+        for i in 0..4
+            let _ = o.push(((v >> (8 * (3 - i))) & 0xFF) as u8)
+
+// Append an option of type `t` with no value, as PFC and ACFC are.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put0(var o, 7)
+//     println("${o.len()} ${o[1]}")   // 2 2
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_put0(var o: PppOpts, t: Int) []
+    if o.len() + 2 <= PPP_OPTS_MAX
+        let _ = o.push(t as u8)
+        let _ = o.push(2)
+
+// Append an option of type `t` with an eight-byte value given as two 32-bit
+// halves, high half first: an IPv6 interface identifier.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put64(var o, 1, 0x02005EFF, 0xFE000001)
+//     println("${o.len()} ${o[2]} ${o[9]}")   // 10 2 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_put64(var o: PppOpts, t: Int, hi: Int, lo: Int) []
+    if o.len() + 10 <= PPP_OPTS_MAX
+        let _ = o.push(t as u8)
+        let _ = o.push(10)
+        for i in 0..4
+            let _ = o.push(((hi >> (8 * (3 - i))) & 0xFF) as u8)
+        for i in 0..4
+            let _ = o.push(((lo >> (8 * (3 - i))) & 0xFF) as u8)
+
+// The 32-bit value of the option of type `t` at its position, counting from
+// byte `at` of the value, or `missing` when the list has no such option or
+// its value is too short.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put32(var o, 2, 0x000A0000)
+//     println("${pppcp.opts_get32(var o, 2, 0, -1)} ${pppcp.opts_get32(var o, 9, 0, -1)}")   // 655360 -1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_get32(var o: PppOpts, t: Int, at: Int, missing: Int) -> Int []
+    let pos = opts_find(var o, t)
+    if pos < 0 or (o[pos + 1] as Int) < 2 + at + 4
+        return missing
+    var v = 0
+    for i in 0..4
+        v = (v << 8) | (o[pos + 2 + at + i] as Int)
+    v
+
+// The 16-bit value of the option of type `t`, or `missing`.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put16(var o, 1, 1500)
+//     println("${pppcp.opts_get16(var o, 1, -1)}")   // 1500
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_get16(var o: PppOpts, t: Int, missing: Int) -> Int []
+    let pos = opts_find(var o, t)
+    if pos < 0 or (o[pos + 1] as Int) < 4
+        return missing
+    ((o[pos + 2] as Int) << 8) | (o[pos + 3] as Int)
+
+// Take the first option of type `t` out of the list.  A list without one is
+// left as it is.
+//
+// ```novo
+// use pppcp
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put0(var o, 7)
+//     pppcp.opts_put0(var o, 8)
+//     pppcp.opts_remove(var o, 7)
+//     println("${o.len()} ${o[0]}")   // 2 8
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_remove(var o: PppOpts, t: Int) []
+    let pos = opts_find(var o, t)
+    if pos < 0
+        return
+    let n = o[pos + 1] as Int
+    var keep: PppOpts = Vec.new()
+    for i in 0..o.len()
+        if i < pos or i >= pos + n
+            let _ = keep.push(o[i])
+    o.clear()
+    for i in 0..keep.len()
+        let _ = o.push(keep[i])
+
+// Overwrite the value of the option of type `t` in the list with the value
+// of the option at `ppos` in the packet, when both exist and have the same
+// length; answers whether it did.  This is how a Configure-Nak's suggestion
+// is taken.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put32(var o, 3, 0)
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 3, 1)
+//     for b in [3, 6, 10, 0, 0, 5]
+//         pppcp.cp_put8(var p, b)
+//     pppcp.cp_end(var p)
+//     let ok = pppcp.opts_adopt(var o, 3, var p, 4)
+//     println("${ok} ${pppcp.opts_get32(var o, 3, 0, -1)}")   // true 167772165
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_adopt(var o: PppOpts, t: Int, var p: PppInfo, ppos: Int) -> Bool []
+    let pos = opts_find(var o, t)
+    let n = opt_len_at(var p, ppos)
+    if pos < 0 or n < 2 or (o[pos + 1] as Int) != n
+        return false
+    for i in 2..n
+        o[pos + i] = p[ppos + i]
+    true
+
+// Whether `p`'s option at `ppos` is present in the list byte for byte: the
+// test for a Configure-Reject, which may only reject what was sent.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put0(var o, 7)
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 4, 1)
+//     pppcp.cp_put8(var p, 7)
+//     pppcp.cp_put8(var p, 2)
+//     pppcp.cp_end(var p)
+//     println("${pppcp.opts_has(var o, var p, 4)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_has(var o: PppOpts, var p: PppInfo, ppos: Int) -> Bool []
+    let n = opt_len_at(var p, ppos)
+    let pos = opts_find(var o, get8(var p, ppos))
+    if n < 2 or pos < 0 or (o[pos + 1] as Int) != n
+        return false
+    for i in 0..n
+        if (o[pos + i] as Int) != get8(var p, ppos + i)
+            return false
+    true
+
+// Whether the packet's options, from byte 4 to its declared length, are
+// exactly the bytes of the list: the test for a Configure-Ack.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put0(var o, 7)
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.cp_begin(var p, 2, 1)
+//     pppcp.cp_put8(var p, 7)
+//     pppcp.cp_put8(var p, 2)
+//     pppcp.cp_end(var p)
+//     println("${pppcp.opts_equal(var o, var p)}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_equal(var o: PppOpts, var p: PppInfo) -> Bool []
+    if cp_len(var p) - 4 != o.len()
+        return false
+    for i in 0..o.len()
+        if (o[i] as Int) != get8(var p, 4 + i)
+            return false
+    true
+
+// Write the list as the data of a Configure-Request: the packet is begun with
+// `code` and `id`, the options follow, and the length is set.
+//
+// ```novo
+// use pppcp
+// use pppframe
+//
+// fn main() [io]
+//     var o: pppcp.PppOpts = Vec.new()
+//     pppcp.opts_put32(var o, 5, 0x11223344)
+//     var p: pppframe.PppInfo = Vec.new()
+//     pppcp.opts_packet(var o, var p, 1, 9)
+//     println("${p.len()} ${pppcp.cp_id(var p)}")   // 10 9
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_packet(var o: PppOpts, var p: PppInfo, code: Int, id: Int) []
+    cp_begin(var p, code, id)
+    for i in 0..o.len()
+        cp_put8(var p, o[i] as Int)
+    cp_end(var p)
