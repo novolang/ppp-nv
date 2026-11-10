@@ -155,10 +155,7 @@ struct PppSession
     // The automata of LCP, IPCP and IPv6CP, by layer index.
     fsm: Vec[PppFsm; 3]
     // The options each layer asks for, by layer index.
-    // workaround(a-vec-of-an-alias-imported-from-another-module-is-not-resolved): the
-    // element is spelled out, `Vec[u8; 64]`, because `PppOpts` from another module is not
-    // resolved inside the type arguments of `Vec`.
-    want: Vec[Vec[u8; 64]; 3]
+    want: Vec[PppOpts; 3]
     // The Configure-Naks sent in a row, by layer index.
     naks_sent: Vec[Int; 3]
     // The Configure-Naks and Rejects taken in a row, by layer index.
@@ -268,12 +265,12 @@ pub @tier(embedded)
 @no_alloc
 fn sess_new() -> PppSession []
     var fsm: Vec[PppFsm; 3] = Vec.new()
-    var want: Vec[Vec[u8; 64]; 3] = Vec.new()
+    var want: Vec[PppOpts; 3] = Vec.new()
     var naks_sent: Vec[Int; 3] = Vec.new()
     var naks_got: Vec[Int; 3] = Vec.new()
     for _i in 0..3
         let _ = fsm.push(pppfsm.fsm_new())
-        var o: Vec[u8; 64] = Vec.new()
+        var o: PppOpts = Vec.new()
         let _ = want.push(o)
         let _ = naks_sent.push(0)
         let _ = naks_got.push(0)

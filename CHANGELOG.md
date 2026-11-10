@@ -56,11 +56,6 @@ The first release.
 
 ### Known
 
-- `pppsess` spells the element of its list of option lists out, `Vec[Vec[u8;
-  64]; 3]`, where `Vec[PppOpts; 3]` would read better. An alias from another
-  module inside the type arguments of `Vec` is not resolved by the
-  compiler. The filing is
-  `a-vec-of-an-alias-imported-from-another-module-is-not-resolved`.
 - The session holds one reply at a time. A caller that does not take the frame
   it asked for before feeding the next byte loses the earlier reply, and
   `tx_lost` counts it.
