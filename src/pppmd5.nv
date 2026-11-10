@@ -1,0 +1,198 @@
+// pppmd5.nv — MD5, RFC 1321, with no allocation: the hash CHAP answers a
+// challenge with.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  The standard
+// library's MD5 answers a hex string and is not part of the embedded tier,
+// and a modem client on a microcontroller is exactly where CHAP is needed,
+// so the package carries the hash itself.  It is a streaming hash: a byte
+// goes in with `md5_byte` and the digest comes out of `md5_finish`, so the
+// three parts of the CHAP response (the identifier, the secret and the
+// challenge) are folded in where they sit and never joined.
+//
+// THE ALGORITHM, from RFC 1321.  The message is padded with a one bit, then
+// zero bits to 56 bytes modulo 64, then its length in bits as eight bytes,
+// low byte first.  Each 64-byte block is read as sixteen 32-bit words, low
+// byte first, and mixed into the four words of the state in 64 steps in four
+// rounds.  A step adds a boolean function of three of the state words, a
+// word of the block and a constant K[i], rotates the sum left by a number of
+// bits that depends on the step, and adds one of the state words to it.  K[i]
+// is the integer part of 2^32 times the absolute value of sin(i + 1), with i
+// in radians.  The arithmetic is modulo 2^32, which an `Int` holds as a
+// number below 2^32 and masks after each addition.  The digest is the four
+// words of the state, low byte first.
+//
+// The suite of RFC 1321 section A.5 is the test of record, and the tests also
+// compare the package with the standard library's `crypto.md5` for printable
+// inputs.  MD5 is broken for signatures; CHAP uses it because RFC 1994 says
+// so, and a challenge the peer chooses is what keeps it useful.
+
+// The size of a digest in bytes: 16.
+pub const MD5_DIGEST_LEN = 16
+
+// A digest: sixteen bytes.
+pub alias Md5Digest = Vec[u8; 16]
+
+// The 64 constants K[i].
+const MD5_K = [
+    0xD76AA478, 0xE8C7B756, 0x242070DB, 0xC1BDCEEE,
+    0xF57C0FAF, 0x4787C62A, 0xA8304613, 0xFD469501,
+    0x698098D8, 0x8B44F7AF, 0xFFFF5BB1, 0x895CD7BE,
+    0x6B901122, 0xFD987193, 0xA679438E, 0x49B40821,
+    0xF61E2562, 0xC040B340, 0x265E5A51, 0xE9B6C7AA,
+    0xD62F105D, 0x02441453, 0xD8A1E681, 0xE7D3FBC8,
+    0x21E1CDE6, 0xC33707D6, 0xF4D50D87, 0x455A14ED,
+    0xA9E3E905, 0xFCEFA3F8, 0x676F02D9, 0x8D2A4C8A,
+    0xFFFA3942, 0x8771F681, 0x6D9D6122, 0xFDE5380C,
+    0xA4BEEA44, 0x4BDECFA9, 0xF6BB4B60, 0xBEBFBC70,
+    0x289B7EC6, 0xEAA127FA, 0xD4EF3085, 0x04881D05,
+    0xD9D4D039, 0xE6DB99E5, 0x1FA27CF8, 0xC4AC5665,
+    0xF4292244, 0x432AFF97, 0xAB9423A7, 0xFC93A039,
+    0x655B59C3, 0x8F0CCC92, 0xFFEFF47D, 0x85845DD1,
+    0x6FA87E4F, 0xFE2CE6E0, 0xA3014314, 0x4E0811A1,
+    0xF7537E82, 0xBD3AF235, 0x2AD7D2BB, 0xEB86D391]
+
+// The left rotation of each step, four values repeated four times in each of
+// the four rounds.
+const MD5_S = [
+    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
+    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
+    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21]
+
+// A hash in progress: the four state words, the block being filled, and the
+// number of bytes taken so far.
+pub @value
+struct Md5
+    // State word A.
+    a: Int
+    // State word B.
+    b: Int
+    // State word C.
+    c: Int
+    // State word D.
+    d: Int
+    // The block being filled, up to 64 bytes.
+    block: Vec[u8; 64]
+    // The bytes taken since `md5_new`.
+    count: Int
+
+// A hash of the empty message so far.
+//
+// ```novo
+// use pppmd5
+//
+// fn main() [io]
+//     let m = pppmd5.md5_new()
+//     println("${m.a} ${m.count}")   // 1732584193 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn md5_new() -> Md5 []
+    Md5 { a: 0x67452301, b: 0xEFCDAB89, c: 0x98BADCFE, d: 0x10325476, block: Vec.new(), count: 0 }
+
+// The word `g` of the block, low byte first.
+@tier(embedded)
+@no_alloc
+fn word(var m: Md5, g: Int) -> Int []
+    (m.block[4 * g] as Int) | ((m.block[4 * g + 1] as Int) << 8) | ((m.block[4 * g + 2] as Int) << 16)
+        | ((m.block[4 * g + 3] as Int) << 24)
+
+// Rotate the 32-bit number `x` left by `s` bits, `s` from 1 to 31.
+@tier(embedded)
+@no_alloc
+fn rotl(x: Int, s: Int) -> Int []
+    ((x << s) | (x >> (32 - s))) & 0xFFFFFFFF
+
+// Mix the full block into the state and empty it.
+@tier(embedded)
+@no_alloc
+fn transform(var m: Md5) []
+    var a = m.a
+    var b = m.b
+    var c = m.c
+    var d = m.d
+    for i in 0..64
+        var f = 0
+        var g = i
+        if i < 16
+            f = (b & c) | ((b ^ 0xFFFFFFFF) & d)
+        elif i < 32
+            f = (d & b) | ((d ^ 0xFFFFFFFF) & c)
+            g = (5 * i + 1) & 15
+        elif i < 48
+            f = b ^ c ^ d
+            g = (3 * i + 5) & 15
+        else
+            f = c ^ (b | (d ^ 0xFFFFFFFF))
+            g = (7 * i) & 15
+        let t = (a + f + MD5_K[i] + word(var m, g)) & 0xFFFFFFFF
+        a = d
+        d = c
+        c = b
+        b = (b + rotl(t, MD5_S[i])) & 0xFFFFFFFF
+    m.a = (m.a + a) & 0xFFFFFFFF
+    m.b = (m.b + b) & 0xFFFFFFFF
+    m.c = (m.c + c) & 0xFFFFFFFF
+    m.d = (m.d + d) & 0xFFFFFFFF
+    m.block.clear()
+
+// Take one byte of the message.
+//
+// ```novo
+// use pppmd5
+//
+// fn main() [io]
+//     var m = pppmd5.md5_new()
+//     for b in [0x61, 0x62, 0x63]
+//         pppmd5.md5_byte(var m, b)
+//     println("${m.count}")   // 3
+// ```
+pub @tier(embedded)
+@no_alloc
+fn md5_byte(var m: Md5, b: Int) []
+    let _ = m.block.push((b & 0xFF) as u8)
+    m.count = m.count + 1
+    if m.block.len() == 64
+        transform(var m)
+
+// Finish the hash: pad the message, mix the last block, and write the
+// digest into `out`, which is emptied first.  The hash is spent afterwards.
+//
+// ```novo
+// use pppmd5
+//
+// fn main() [io]
+//     var m = pppmd5.md5_new()
+//     for b in [0x61, 0x62, 0x63]
+//         pppmd5.md5_byte(var m, b)
+//     var d: pppmd5.Md5Digest = Vec.new()
+//     pppmd5.md5_finish(var m, var d)
+//     println("${d[0]} ${d[1]} ${d[15]}")   // 144 1 114
+// ```
+pub @tier(embedded)
+@no_alloc
+fn md5_finish(var m: Md5, var out: Md5Digest) []
+    let nbits = m.count * 8
+    md5_byte(var m, 0x80)
+    for _i in 0..64
+        if (m.count & 63) != 56
+            md5_byte(var m, 0)
+    for i in 0..8
+        md5_byte(var m, (nbits >> (8 * i)) & 0xFF)
+    out.clear()
+    for i in 0..4
+        let w = state_word(var m, i)
+        for j in 0..4
+            let _ = out.push(((w >> (8 * j)) & 0xFF) as u8)
+
+// State word `i`, 0 to 3.
+@tier(embedded)
+@no_alloc
+fn state_word(var m: Md5, i: Int) -> Int []
+    if i == 0
+        return m.a
+    if i == 1
+        return m.b
+    if i == 2
+        return m.c
+    m.d

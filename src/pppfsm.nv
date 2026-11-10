@@ -1,0 +1,317 @@
+// pppfsm.nv — the option negotiation automaton of RFC 1661 section 4, with
+// no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  LCP, IPCP and IPv6CP
+// negotiate the same way: each end sends a Configure-Request, the other
+// answers with an Ack, a Nak that suggests values, or a Reject of options it
+// will not do, and the layer is open when each end has had its request
+// acknowledged and has acknowledged the other's.  RFC 1661 specifies that
+// as one automaton of ten states and sixteen events, and RFC 1332 and RFC
+// 5072 reuse it for the network protocols.  This module is that automaton
+// and nothing of what the options mean.
+//
+// A STATE is held in `PppFsm.state`:
+//
+//   0 Initial    the lower layer is down and nothing has asked to open
+//   1 Starting   an Open was asked, and the lower layer is not up
+//   2 Closed     the lower layer is up and no Open was asked
+//   3 Stopped    this end gave up, or was told to stop, with the lower layer up
+//   4 Closing    a Terminate-Request is out after a Close
+//   5 Stopping   a Terminate-Request is out after the peer or a failure
+//   6 Req-Sent   a Configure-Request is out
+//   7 Ack-Rcvd   the peer acknowledged it, and has not yet asked for anything
+//   8 Ack-Sent   this end acknowledged the peer's request, and is waiting
+//   9 Opened     both directions are agreed
+//
+// An EVENT is what happened.  The lower layer came `UP` or went `DOWN`; the
+// administrator asked to `OPEN` or `CLOSE`; the restart timer expired with
+// tries left (`TO+`, written `TO_PLUS`) or with none (`TO-`, `TO_MINUS`); a
+// Configure-Request arrived that this end finds acceptable (`RCR+`,
+// `RCR_PLUS`) or not (`RCR-`, `RCR_MINUS`); a Configure-Ack (`RCA`), a
+// Configure-Nak or Reject (`RCN`), a Terminate-Request (`RTR`) or a
+// Terminate-Ack (`RTA`) arrived; a packet of an unknown code (`RUC`); a
+// Code-Reject or Protocol-Reject that is tolerable (`RXJ+`) or fatal (`RXJ-`);
+// or an Echo-Request, Echo-Reply or Discard-Request (`RXR`).
+//
+// An ACTION is what to do about it, and `fsm_event` answers the set as a mask
+// of the `PPP_A_` bits:
+//
+//   `TLU` this-layer-up, `TLD` this-layer-down, `TLS` this-layer-started,
+//   `TLF` this-layer-finished: the layer above is told
+//   `SCR` send a Configure-Request, `SCA` a Configure-Ack, `SCN` a
+//   Configure-Nak or Reject (whichever the caller built), `STR` a
+//   Terminate-Request, `STA` a Terminate-Ack, `SCJ` a Code-Reject,
+//   `SER` an Echo-Reply
+//   `IRC` initialize-restart-count and `ZRC` zero-restart-count, which this
+//   module has already done: they are in the mask so that the table reads
+//   as the RFC prints it.
+//
+// THE RESTART TIMER AND COUNTER belong to the automaton and are driven by
+// the caller's clock.  `fsm_tick` takes the milliseconds that have passed
+// and, when the interval is over, makes the `TO_PLUS` or `TO_MINUS` event of
+// itself.  The timer runs in states 4 to 8, starts again whenever a request
+// is sent, and stops in every other state.  The counter is set by `IRC` to
+// Max-Terminate when the state that follows is Closing or Stopping and to
+// Max-Configure (10) otherwise, and is decremented by each `SCR` and `STR`.
+// RFC 1661 asks for a restart interval of about 3 seconds; it is a field of
+// `PppFsm`.
+//
+// A transition that RFC 1661 marks as impossible, an Up event in the
+// Opened state for one, does nothing and leaves the state alone.  RFC 1661
+// section 4.6 allows an implementation to stay put there, and a peer that
+// sends a packet in the wrong state must not be able to wedge this end.
+//
+// The Restart option (the `r` footnote in the RFC's table, which restarts the
+// negotiation on an Open in states 3, 4, 5 and 9) is not implemented; those
+// cells leave the state alone.
+
+// State 0.
+pub const PPP_S_INITIAL = 0
+// State 1.
+pub const PPP_S_STARTING = 1
+// State 2.
+pub const PPP_S_CLOSED = 2
+// State 3.
+pub const PPP_S_STOPPED = 3
+// State 4.
+pub const PPP_S_CLOSING = 4
+// State 5.
+pub const PPP_S_STOPPING = 5
+// State 6.
+pub const PPP_S_REQ_SENT = 6
+// State 7.
+pub const PPP_S_ACK_RCVD = 7
+// State 8.
+pub const PPP_S_ACK_SENT = 8
+// State 9.
+pub const PPP_S_OPENED = 9
+
+// Event: the lower layer is up.
+pub const PPP_E_UP = 0
+// Event: the lower layer is down.
+pub const PPP_E_DOWN = 1
+// Event: the administrator asked to open.
+pub const PPP_E_OPEN = 2
+// Event: the administrator asked to close.
+pub const PPP_E_CLOSE = 3
+// Event: the restart timer expired and tries are left.
+pub const PPP_E_TO_PLUS = 4
+// Event: the restart timer expired and no tries are left.
+pub const PPP_E_TO_MINUS = 5
+// Event: a good Configure-Request arrived.
+pub const PPP_E_RCR_PLUS = 6
+// Event: an unacceptable Configure-Request arrived.
+pub const PPP_E_RCR_MINUS = 7
+// Event: a Configure-Ack arrived.
+pub const PPP_E_RCA = 8
+// Event: a Configure-Nak or Configure-Reject arrived.
+pub const PPP_E_RCN = 9
+// Event: a Terminate-Request arrived.
+pub const PPP_E_RTR = 10
+// Event: a Terminate-Ack arrived.
+pub const PPP_E_RTA = 11
+// Event: a packet of an unknown code arrived.
+pub const PPP_E_RUC = 12
+// Event: a tolerable Code-Reject or Protocol-Reject arrived.
+pub const PPP_E_RXJ_PLUS = 13
+// Event: a fatal Code-Reject or Protocol-Reject arrived.
+pub const PPP_E_RXJ_MINUS = 14
+// Event: an Echo-Request, Echo-Reply or Discard-Request arrived.
+pub const PPP_E_RXR = 15
+
+// Action: this-layer-up.
+pub const PPP_A_TLU = 1
+// Action: this-layer-down.
+pub const PPP_A_TLD = 2
+// Action: this-layer-started.
+pub const PPP_A_TLS = 4
+// Action: this-layer-finished.
+pub const PPP_A_TLF = 8
+// Action: initialize-restart-count, already done.
+pub const PPP_A_IRC = 16
+// Action: zero-restart-count, already done.
+pub const PPP_A_ZRC = 32
+// Action: send-configure-request.
+pub const PPP_A_SCR = 64
+// Action: send-configure-ack.
+pub const PPP_A_SCA = 128
+// Action: send-configure-nak (or reject).
+pub const PPP_A_SCN = 256
+// Action: send-terminate-request.
+pub const PPP_A_STR = 512
+// Action: send-terminate-ack.
+pub const PPP_A_STA = 1024
+// Action: send-code-reject.
+pub const PPP_A_SCJ = 2048
+// Action: send-echo-reply.
+pub const PPP_A_SER = 4096
+
+// Max-Configure of RFC 1661: 10 Configure-Requests without a valid answer.
+pub const PPP_MAX_CONFIGURE = 10
+// Max-Terminate of RFC 1661: 2 Terminate-Requests.
+pub const PPP_MAX_TERMINATE = 2
+// The restart interval of RFC 1661, in milliseconds: 3000.
+pub const PPP_RESTART_MS = 3000
+
+// The table: 16 rows of events by 10 columns of states.  A cell holds the
+// actions as a mask shifted up four bits, and the next state in the low
+// four; a next state of 15 means the state stays.
+const FSM_TABLE = [
+    0x2, 0x506, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF, 0xF,
+    0xF, 0xF, 0x0, 0x41, 0x0, 0x1, 0x1, 0x1, 0x1, 0x21,
+    0x41, 0x1, 0x506, 0x3, 0x5, 0x5, 0x6, 0x7, 0x8, 0x9,
+    0x0, 0x80, 0x2, 0x2, 0x4, 0x4, 0x2104, 0x2104, 0x2104, 0x2124,
+    0xF, 0xF, 0xF, 0xF, 0x2004, 0x2005, 0x406, 0x406, 0x408, 0xF,
+    0xF, 0xF, 0xF, 0xF, 0x82, 0x83, 0x83, 0x83, 0x83, 0xF,
+    0xF, 0xF, 0x4002, 0xD08, 0x4, 0x5, 0x808, 0x819, 0x808, 0xC28,
+    0xF, 0xF, 0x4002, 0x1506, 0x4, 0x5, 0x1006, 0x1007, 0x1006, 0x1426,
+    0xF, 0xF, 0x4002, 0x4003, 0x4, 0x5, 0x107, 0x406, 0x119, 0x426,
+    0xF, 0xF, 0x4002, 0x4003, 0x4, 0x5, 0x506, 0x406, 0x508, 0x426,
+    0xF, 0xF, 0x4002, 0x4003, 0x4004, 0x4005, 0x4006, 0x4006, 0x4006, 0x4225,
+    0xF, 0xF, 0x2, 0x3, 0x82, 0x83, 0x6, 0x6, 0x8, 0x426,
+    0xF, 0xF, 0x8002, 0x8003, 0x8004, 0x8005, 0x8006, 0x8007, 0x8008, 0x8009,
+    0xF, 0xF, 0x2, 0x3, 0x4, 0x5, 0x6, 0x6, 0x8, 0x9,
+    0xF, 0xF, 0x82, 0x83, 0x82, 0x83, 0x83, 0x83, 0x83, 0x2125,
+    0xF, 0xF, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x10009]
+
+// One automaton: the state, the counter and the timer, and the identifier
+// of the last request sent.
+//
+// The fields are readable and are not for writing; the functions of this
+// module are the only writers.
+pub @value
+struct PppFsm
+    // One of the `PPP_S_` states.
+    state: Int
+    // Tries left before the timer gives up.
+    restart: Int
+    // Max-Configure.
+    max_configure: Int
+    // Max-Terminate.
+    max_terminate: Int
+    // The restart interval in milliseconds.
+    interval_ms: Int
+    // Milliseconds since the timer was last started.
+    elapsed_ms: Int
+    // Whether the timer is running.
+    running: Bool
+    // The identifier of the last Configure-Request or Terminate-Request.
+    id: Int
+    // Whether the last `SCR` or `STR` was asked for by the timer, so the
+    // request is the same one again.
+    retransmit: Bool
+
+// An automaton in the Initial state with the defaults of RFC 1661.
+//
+// ```novo
+// use pppfsm
+//
+// fn main() [io]
+//     let f = pppfsm.fsm_new()
+//     println("${f.state} ${f.max_configure} ${f.interval_ms}")   // 0 10 3000
+// ```
+pub @tier(embedded)
+@no_alloc
+fn fsm_new() -> PppFsm []
+    PppFsm { state: PPP_S_INITIAL, restart: 0, max_configure: PPP_MAX_CONFIGURE,
+             max_terminate: PPP_MAX_TERMINATE, interval_ms: PPP_RESTART_MS, elapsed_ms: 0,
+             running: false, id: 0, retransmit: false }
+
+// Whether the restart timer runs in `state`: Closing, Stopping, Req-Sent,
+// Ack-Rcvd and Ack-Sent.
+@tier(embedded)
+@no_alloc
+fn timed(state: Int) -> Bool []
+    state >= PPP_S_CLOSING and state <= PPP_S_ACK_SENT
+
+// The next identifier: one more, wrapping at 255.
+//
+// ```novo
+// use pppfsm
+//
+// fn main() [io]
+//     var f = pppfsm.fsm_new()
+//     pppfsm.fsm_next_id(var f)
+//     println("${f.id}")   // 1
+// ```
+pub @tier(embedded)
+@no_alloc
+fn fsm_next_id(var f: PppFsm) []
+    f.id = (f.id + 1) & 0xFF
+
+// Make the transition for `event`: change the state, keep the counter and the
+// timer as the actions say, and answer the actions as a mask of the `PPP_A_`
+// bits.  An event number outside 0 to 15 does nothing.
+//
+// ```novo
+// use pppfsm
+//
+// fn main() [io]
+//     var f = pppfsm.fsm_new()
+//     let a = pppfsm.fsm_event(var f, pppfsm.PPP_E_UP)
+//     let b = pppfsm.fsm_event(var f, pppfsm.PPP_E_OPEN)
+//     println("${a} ${b} ${f.state}")   // 0 80 6
+// ```
+pub @tier(embedded)
+@no_alloc
+fn fsm_event(var f: PppFsm, event: Int) -> Int []
+    f.retransmit = false
+    if event < 0 or event > PPP_E_RXR
+        return 0
+    let cell = FSM_TABLE[event * 10 + f.state]
+    let acts = cell >> 4
+    let next = cell & 15
+    var to = f.state
+    if next != 15
+        to = next
+    if (acts & PPP_A_IRC) != 0
+        if to == PPP_S_CLOSING or to == PPP_S_STOPPING
+            f.restart = f.max_terminate
+        else
+            f.restart = f.max_configure
+    if (acts & PPP_A_ZRC) != 0
+        f.restart = 0
+        f.elapsed_ms = 0
+        f.running = true
+    if (acts & (PPP_A_SCR | PPP_A_STR)) != 0
+        if f.restart > 0
+            f.restart = f.restart - 1
+        f.elapsed_ms = 0
+        f.running = true
+    f.state = to
+    if not timed(to)
+        f.running = false
+    acts
+
+// Let `ms` milliseconds pass.  When the restart interval is over the timer
+// makes its own event, `TO_PLUS` if the counter has tries left and
+// `TO_MINUS` if not, and the actions of that are answered; otherwise 0.
+//
+// When the actions include `SCR` or `STR`, `f.retransmit` is true: the
+// request is the same one again.
+//
+// ```novo
+// use pppfsm
+//
+// fn main() [io]
+//     var f = pppfsm.fsm_new()
+//     let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_UP)
+//     let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_OPEN)
+//     let a = pppfsm.fsm_tick(var f, 3000)
+//     println("${a} ${f.retransmit}")   // 64 true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn fsm_tick(var f: PppFsm, ms: Int) -> Int []
+    if not f.running or ms <= 0
+        return 0
+    f.elapsed_ms = f.elapsed_ms + ms
+    if f.elapsed_ms < f.interval_ms
+        return 0
+    f.elapsed_ms = 0
+    var event = PPP_E_TO_MINUS
+    if f.restart > 0
+        event = PPP_E_TO_PLUS
+    let acts = fsm_event(var f, event)
+    f.retransmit = (acts & (PPP_A_SCR | PPP_A_STR)) != 0
+    acts

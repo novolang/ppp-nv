@@ -1,0 +1,296 @@
+// pppfsm_tests.nv — the automaton of RFC 1661 section 4.1, cell by cell.
+//
+// `rfc_rows` is the transition table as the RFC prints it, one row per event
+// and one cell per state, typed here from the RFC and not generated from the
+// package's table.  A cell reads "actions/next state": "irc,scr/6" is
+// initialize-restart-count and send-configure-request, then state 6; a cell
+// that is only a number changes the state and does nothing else; "-" is a
+// transition that does not exist, which must change nothing.
+//
+// Each of the 160 cells is tried by placing an automaton in the cell's state
+// by legal events (`reach`) and making the cell's event.  The path to each
+// state is:
+//
+//     0 Initial    nothing
+//     1 Starting   Open
+//     2 Closed     Up
+//     3 Stopped    Up, Open, RXJ-
+//     4 Closing    Up, Open, Close
+//     5 Stopping   Up, Open, RCR+, RCA, RTR
+//     6 Req-Sent   Up, Open
+//     7 Ack-Rcvd   Up, Open, RCA
+//     8 Ack-Sent   Up, Open, RCR+
+//     9 Opened     Up, Open, RCR+, RCA
+//
+// The counter and the timer are tested after the table: Max-Configure
+// Configure-Requests and then a give-up, Max-Terminate Terminate-Requests,
+// the interval, and the partial ticks that add up to one.
+
+use std.list
+use std.str
+use std.test
+use pppfsm
+
+// The RFC's table: 16 events by 10 states.
+fn rfc_rows() -> [[Str]]
+    [["2", "irc,scr/6", "-", "-", "-", "-", "-", "-", "-", "-"],
+     ["-", "-", "0", "tls/1", "0", "1", "1", "1", "1", "tld/1"],
+     ["tls/1", "1", "irc,scr/6", "3", "5", "5", "6", "7", "8", "9"],
+     ["0", "tlf/0", "2", "2", "4", "4", "irc,str/4", "irc,str/4", "irc,str/4", "tld,irc,str/4"],
+     ["-", "-", "-", "-", "str/4", "str/5", "scr/6", "scr/6", "scr/8", "-"],
+     ["-", "-", "-", "-", "tlf/2", "tlf/3", "tlf/3", "tlf/3", "tlf/3", "-"],
+     ["-", "-", "sta/2", "irc,scr,sca/8", "4", "5", "sca/8", "sca,tlu/9", "sca/8", "tld,scr,sca/8"],
+     ["-", "-", "sta/2", "irc,scr,scn/6", "4", "5", "scn/6", "scn/7", "scn/6", "tld,scr,scn/6"],
+     ["-", "-", "sta/2", "sta/3", "4", "5", "irc/7", "scr/6", "irc,tlu/9", "tld,scr/6"],
+     ["-", "-", "sta/2", "sta/3", "4", "5", "irc,scr/6", "scr/6", "irc,scr/8", "tld,scr/6"],
+     ["-", "-", "sta/2", "sta/3", "sta/4", "sta/5", "sta/6", "sta/6", "sta/6", "tld,zrc,sta/5"],
+     ["-", "-", "2", "3", "tlf/2", "tlf/3", "6", "6", "8", "tld,scr/6"],
+     ["-", "-", "scj/2", "scj/3", "scj/4", "scj/5", "scj/6", "scj/7", "scj/8", "scj/9"],
+     ["-", "-", "2", "3", "4", "5", "6", "6", "8", "9"],
+     ["-", "-", "tlf/2", "tlf/3", "tlf/2", "tlf/3", "tlf/3", "tlf/3", "tlf/3", "tld,irc,str/5"],
+     ["-", "-", "2", "3", "4", "5", "6", "7", "8", "ser/9"]]
+
+// The bit of an action name.
+fn action_bit(name: Str) -> Int
+    if name == "tlu"
+        return pppfsm.PPP_A_TLU
+    if name == "tld"
+        return pppfsm.PPP_A_TLD
+    if name == "tls"
+        return pppfsm.PPP_A_TLS
+    if name == "tlf"
+        return pppfsm.PPP_A_TLF
+    if name == "irc"
+        return pppfsm.PPP_A_IRC
+    if name == "zrc"
+        return pppfsm.PPP_A_ZRC
+    if name == "scr"
+        return pppfsm.PPP_A_SCR
+    if name == "sca"
+        return pppfsm.PPP_A_SCA
+    if name == "scn"
+        return pppfsm.PPP_A_SCN
+    if name == "str"
+        return pppfsm.PPP_A_STR
+    if name == "sta"
+        return pppfsm.PPP_A_STA
+    if name == "scj"
+        return pppfsm.PPP_A_SCJ
+    if name == "ser"
+        return pppfsm.PPP_A_SER
+    -1
+
+// The actions of a cell as a mask: the part before the slash, if any.
+fn cell_actions(cell: Str) -> Int
+    if cell == "-"
+        return 0
+    let halves = str.split(cell, "/")
+    if list.len(halves) < 2
+        return 0
+    var mask = 0
+    for name in str.split(halves[0], ",")
+        mask = mask | action_bit(name)
+    mask
+
+// The state a cell leads to, or -1 when the state stays.
+fn cell_next(cell: Str) -> Int
+    if cell == "-"
+        return -1
+    let halves = str.split(cell, "/")
+    str.to_int(halves[list.len(halves) - 1]) ?? -1
+
+// An automaton placed in `state` by legal events.
+fn reach(state: Int) -> pppfsm.PppFsm
+    var f = pppfsm.fsm_new()
+    if state == 1
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_OPEN)
+    if state >= 2
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_UP)
+    if state >= 3
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_OPEN)
+    if state == 3
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_RXJ_MINUS)
+    if state == 4
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_CLOSE)
+    if state == 7
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_RCA)
+    if state == 8 or state == 9 or state == 5
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_RCR_PLUS)
+    if state == 9 or state == 5
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_RCA)
+    if state == 5
+        let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_RTR)
+    f
+
+@test
+fn test_reach_places_the_automaton_in_every_state() [io]
+    for s in 0..10
+        test.case("state ${s}")
+        test.assert_eq(reach(s).state, s)
+
+@test
+fn test_every_cell_of_the_table_in_the_rfc() [io]
+    let rows = rfc_rows()
+    test.assert_eq(list.len(rows), 16)
+    for e in 0..16
+        test.assert_eq(list.len(rows[e]), 10)
+        for s in 0..10
+            let cell = rows[e][s]
+            var f = reach(s)
+            let got = pppfsm.fsm_event(var f, e)
+            test.case("event ${e} in state ${s}: ${cell}")
+            test.assert_eq(got, cell_actions(cell))
+            var want = cell_next(cell)
+            if want < 0
+                want = s
+            test.assert_eq(f.state, want)
+
+@test
+fn test_an_event_outside_the_table_does_nothing() [io]
+    var f = reach(9)
+    test.assert_eq(pppfsm.fsm_event(var f, -1), 0)
+    test.assert_eq(pppfsm.fsm_event(var f, 16), 0)
+    test.assert_eq(f.state, 9)
+
+// ── The restart counter and the timer ──────────────────────────────
+
+// Drive an automaton with the interval until it gives up, counting the
+// requests; answers the count of SCR actions.
+fn count_requests(var f: pppfsm.PppFsm, first: Int) -> Int
+    var scr = first
+    for _i in 0..30
+        let a = pppfsm.fsm_tick(var f, 3000)
+        if (a & pppfsm.PPP_A_SCR) != 0
+            scr = scr + 1
+    scr
+
+@test
+fn test_a_peer_that_never_answers_gets_max_configure_requests() [io]
+    var f = pppfsm.fsm_new()
+    let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_UP)
+    let first = pppfsm.fsm_event(var f, pppfsm.PPP_E_OPEN)
+    test.assert_eq(first & pppfsm.PPP_A_SCR, pppfsm.PPP_A_SCR)
+    test.assert_eq(f.restart, 9)
+    test.assert_eq(count_requests(var f, 1), 10)
+    // Then the layer finished: Stopped.
+    test.assert_eq(f.state, pppfsm.PPP_S_STOPPED)
+    test.assert_eq(f.running, false)
+
+@test
+fn test_the_give_up_asks_the_layer_to_finish() [io]
+    var f = pppfsm.fsm_new()
+    let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_UP)
+    let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_OPEN)
+    var last = 0
+    for _i in 0..30
+        let a = pppfsm.fsm_tick(var f, 3000)
+        if a != 0
+            last = a
+    test.assert_eq(last, pppfsm.PPP_A_TLF)
+
+@test
+fn test_a_closing_layer_sends_max_terminate_requests() [io]
+    var f = reach(9)
+    let a = pppfsm.fsm_event(var f, pppfsm.PPP_E_CLOSE)
+    test.assert_eq(a, pppfsm.PPP_A_TLD | pppfsm.PPP_A_IRC | pppfsm.PPP_A_STR)
+    test.assert_eq(f.state, pppfsm.PPP_S_CLOSING)
+    // irc set 2, str took one.
+    test.assert_eq(f.restart, 1)
+    var strs = 1
+    var finished = 0
+    for _i in 0..10
+        let t = pppfsm.fsm_tick(var f, 3000)
+        if (t & pppfsm.PPP_A_STR) != 0
+            strs = strs + 1
+        if (t & pppfsm.PPP_A_TLF) != 0
+            finished = finished + 1
+    test.assert_eq(strs, 2)
+    test.assert_eq(finished, 1)
+    test.assert_eq(f.state, pppfsm.PPP_S_CLOSED)
+
+@test
+fn test_a_stopping_layer_that_hears_nothing_ends_in_stopped() [io]
+    var f = reach(5)
+    test.assert_eq(f.restart, 0)
+    // Zero-restart-count armed the timer with no tries left.
+    test.assert_eq(f.running, true)
+    test.assert_eq(pppfsm.fsm_tick(var f, 2999), 0)
+    test.assert_eq(pppfsm.fsm_tick(var f, 1), pppfsm.PPP_A_TLF)
+    test.assert_eq(f.state, pppfsm.PPP_S_STOPPED)
+
+@test
+fn test_partial_ticks_add_up_to_the_interval() [io]
+    var f = reach(6)
+    test.assert_eq(pppfsm.fsm_tick(var f, 1000), 0)
+    test.assert_eq(pppfsm.fsm_tick(var f, 1000), 0)
+    test.assert_eq(f.elapsed_ms, 2000)
+    test.assert_eq(pppfsm.fsm_tick(var f, 1000), pppfsm.PPP_A_SCR)
+    test.assert_eq(f.elapsed_ms, 0)
+
+@test
+fn test_a_tick_of_nothing_or_less_does_nothing() [io]
+    var f = reach(6)
+    test.assert_eq(pppfsm.fsm_tick(var f, 0), 0)
+    test.assert_eq(pppfsm.fsm_tick(var f, -5), 0)
+    test.assert_eq(f.elapsed_ms, 0)
+
+@test
+fn test_the_timer_does_not_run_in_opened_closed_or_initial() [io]
+    for s in [0, 1, 2, 3, 9]
+        var f = reach(s)
+        test.case("state ${s}")
+        test.assert_eq(f.running, false)
+        test.assert_eq(pppfsm.fsm_tick(var f, 100000), 0)
+        test.assert_eq(f.state, s)
+
+@test
+fn test_the_timer_runs_in_the_five_waiting_states() [io]
+    for s in [4, 5, 6, 7, 8]
+        var f = reach(s)
+        test.case("state ${s}")
+        test.assert_eq(f.running, true)
+
+@test
+fn test_a_request_sent_by_the_timer_is_marked_as_a_retransmission() [io]
+    var f = reach(6)
+    test.assert_eq(f.retransmit, false)
+    let _ = pppfsm.fsm_tick(var f, 3000)
+    test.assert_eq(f.retransmit, true)
+    // Any other event clears the mark.
+    let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_RXR)
+    test.assert_eq(f.retransmit, false)
+
+@test
+fn test_a_give_up_is_not_a_retransmission() [io]
+    var f = reach(5)
+    let a = pppfsm.fsm_tick(var f, 3000)
+    test.assert_eq(a & (pppfsm.PPP_A_SCR | pppfsm.PPP_A_STR), 0)
+    test.assert_eq(f.retransmit, false)
+
+@test
+fn test_an_ack_restores_the_count_of_tries() [io]
+    // In Req-Sent, a Configure-Ack runs irc: the count is Max-Configure again.
+    var f = reach(6)
+    let _ = pppfsm.fsm_tick(var f, 3000)
+    let _ = pppfsm.fsm_tick(var f, 3000)
+    test.assert_eq(f.restart, 7)
+    let _ = pppfsm.fsm_event(var f, pppfsm.PPP_E_RCA)
+    test.assert_eq(f.restart, 10)
+
+@test
+fn test_the_identifier_wraps_at_255() [io]
+    var f = pppfsm.fsm_new()
+    for _i in 0..255
+        pppfsm.fsm_next_id(var f)
+    test.assert_eq(f.id, 255)
+    pppfsm.fsm_next_id(var f)
+    test.assert_eq(f.id, 0)
+
+@test
+fn test_the_defaults_are_those_of_the_rfc() [io]
+    let f = pppfsm.fsm_new()
+    test.assert_eq(f.state, 0)
+    test.assert_eq(f.max_configure, 10)
+    test.assert_eq(f.max_terminate, 2)
+    test.assert_eq(f.interval_ms, 3000)
+    test.assert_eq(f.running, false)

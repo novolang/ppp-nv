@@ -1,0 +1,124 @@
+// pppmd5_tests.nv — MD5 against the suite of RFC 1321 section A.5.
+//
+// The seven messages and digests are those the RFC prints:
+//
+//     ""                                 d41d8cd98f00b204e9800998ecf8427e
+//     "a"                                0cc175b9c0f1b6a831c399e269772661
+//     "abc"                              900150983cd24fb0d6963f7d28e17f72
+//     "message digest"                   f96b697d7cb7938d525a2f31aaf161d0
+//     "abcdefghijklmnopqrstuvwxyz"       c3fcd3d76192e4007dfb496cca67e13b
+//     "A-Za-z0-9" (62 characters)        d174ab98d277d9f5a5611c2c9f419d9f
+//     "1234567890" eight times (80)      57edf4a22be3c955ac49da2e2107b67a
+//
+// The lengths that matter to the padding are covered as well: 55 bytes (the
+// length fits in the same block), 56 (it does not, so a block of padding
+// follows), 63, 64 and 65.  For those, and for inputs of printable
+// characters, the digest is compared with the standard library's
+// `crypto.md5`, which answers a hex string.  The constant table is
+// recomputed from the sine.
+
+use std.crypto
+use std.list
+use std.math
+use std.str
+use std.test
+use pppmd5
+
+// The hex string of a digest.
+fn hex_of(var d: pppmd5.Md5Digest) -> Str
+    let digits = "0123456789abcdef"
+    var s = ""
+    for i in 0..d.len()
+        let b = d[i] as Int
+        s = s + str.slice(digits, b >> 4, (b >> 4) + 1) + str.slice(digits, b & 15, (b & 15) + 1)
+    s
+
+// The MD5 of a string, as hex, through the package.
+fn md5_hex(s: Str) -> Str
+    var m = pppmd5.md5_new()
+    for i in 0..str.len(s)
+        pppmd5.md5_byte(var m, str.byte_at_or(s, i, 0))
+    var d: pppmd5.Md5Digest = Vec.new()
+    pppmd5.md5_finish(var m, var d)
+    hex_of(var d)
+
+// `n` printable characters, from a fixed cycle.
+fn printable(n: Int) -> Str
+    let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,-"
+    var s = ""
+    for i in 0..n
+        let k = (i * 7 + 3) % str.len(alphabet)
+        s = s + str.slice(alphabet, k, k + 1)
+    s
+
+@test
+fn test_the_rfc_1321_suite() [io]
+    test.assert_eq_str(md5_hex(""), "d41d8cd98f00b204e9800998ecf8427e")
+    test.assert_eq_str(md5_hex("a"), "0cc175b9c0f1b6a831c399e269772661")
+    test.assert_eq_str(md5_hex("abc"), "900150983cd24fb0d6963f7d28e17f72")
+    test.assert_eq_str(md5_hex("message digest"), "f96b697d7cb7938d525a2f31aaf161d0")
+    test.assert_eq_str(md5_hex("abcdefghijklmnopqrstuvwxyz"), "c3fcd3d76192e4007dfb496cca67e13b")
+    test.assert_eq_str(md5_hex("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"),
+                       "d174ab98d277d9f5a5611c2c9f419d9f")
+    test.assert_eq_str(md5_hex("12345678901234567890123456789012345678901234567890123456789012345678901234567890"),
+                       "57edf4a22be3c955ac49da2e2107b67a")
+
+@test
+fn test_the_padding_edges_agree_with_the_standard_library() [io]
+    for n in [0, 1, 54, 55, 56, 57, 63, 64, 65, 119, 120, 127, 128, 129, 300]
+        let s = printable(n)
+        test.case("length ${n}")
+        test.assert_eq_str(md5_hex(s), crypto.md5(s))
+
+@test
+fn test_the_constants_follow_from_the_sine() [io]
+    for i in 0..64
+        let want = (math.abs(math.sin(i + 1.0)) * 4294967296.0) as Int
+        test.assert_eq(pppmd5.MD5_K[i], want)
+
+@test
+fn test_the_count_and_the_empty_block() [io]
+    var m = pppmd5.md5_new()
+    test.assert_eq(m.count, 0)
+    pppmd5.md5_byte(var m, 0x41)
+    test.assert_eq(m.count, 1)
+    test.assert_eq(m.block.len(), 1)
+    for _i in 0..63
+        pppmd5.md5_byte(var m, 0x41)
+    // The 64th byte filled the block, which was mixed in and emptied.
+    test.assert_eq(m.count, 64)
+    test.assert_eq(m.block.len(), 0)
+
+@test
+fn test_only_the_low_byte_of_the_input_is_taken() [io]
+    var a = pppmd5.md5_new()
+    var b = pppmd5.md5_new()
+    pppmd5.md5_byte(var a, 0x61)
+    pppmd5.md5_byte(var b, 0x161)
+    var da: pppmd5.Md5Digest = Vec.new()
+    var db: pppmd5.Md5Digest = Vec.new()
+    pppmd5.md5_finish(var a, var da)
+    pppmd5.md5_finish(var b, var db)
+    test.assert_eq_str(hex_of(var da), hex_of(var db))
+    test.assert_eq_str(hex_of(var da), "0cc175b9c0f1b6a831c399e269772661")
+
+@test
+fn test_finish_empties_the_digest_buffer_first() [io]
+    var m = pppmd5.md5_new()
+    var d: pppmd5.Md5Digest = Vec.new()
+    for _i in 0..16
+        let _ = d.push(0xEE)
+    pppmd5.md5_finish(var m, var d)
+    test.assert_eq(d.len(), 16)
+    test.assert_eq_str(hex_of(var d), "d41d8cd98f00b204e9800998ecf8427e")
+
+@test
+fn test_every_byte_value_agrees_with_a_second_implementation() [io]
+    // The digest of the 256 bytes 00 to FF, from Python's hashlib:
+    // e2c865db4162bed963bfaa9ef6ac18f0.
+    var m = pppmd5.md5_new()
+    for b in 0..256
+        pppmd5.md5_byte(var m, b)
+    var d: pppmd5.Md5Digest = Vec.new()
+    pppmd5.md5_finish(var m, var d)
+    test.assert_eq_str(hex_of(var d), "e2c865db4162bed963bfaa9ef6ac18f0")
