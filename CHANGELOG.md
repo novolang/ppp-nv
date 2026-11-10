@@ -60,7 +60,7 @@ The first release.
   64]; 3]`, where `Vec[PppOpts; 3]` would read better. An alias from another
   module inside the type arguments of `Vec` is not resolved by the
   compiler. The filing is
-  `a-cross-module-alias-as-the-element-of-a-heapless-vec-is-not-resolved`.
+  `a-vec-of-an-alias-imported-from-another-module-is-not-resolved`.
 - The session holds one reply at a time. A caller that does not take the frame
   it asked for before feeding the next byte loses the earlier reply, and
   `tx_lost` counts it.
