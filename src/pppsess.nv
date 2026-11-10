@@ -1165,7 +1165,7 @@ fn sess_send(var s: PppSession, proto: Int, var info: PppInfo, var wire: PppWire
 //     var w: pppframe.PppWire = Vec.new()
 //     let first = pppsess.sess_tx(var s, var w)
 //     let second = pppsess.sess_tx(var s, var w)
-//     println("${first} ${second} ${w.len()}")   // true false 38
+//     println("${first} ${second} ${w.len()}")   // true false 37
 // ```
 pub @tier(embedded)
 @no_alloc
