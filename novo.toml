@@ -1,0 +1,24 @@
+[package]
+name        = "ppp-nv"
+version     = "0.1.0"
+description = "PPP for novo-lang over an asynchronous link, the modem path of a cellular module: the HDLC-like framing of RFC 1662 with its FCS, the Link Control Protocol and its option negotiation automaton (RFC 1661), IPCP with the DNS options (RFC 1332, RFC 1877), IPv6CP (RFC 5072), PAP and CHAP-MD5 as the client answers them, as a session a caller drives with the bytes of the serial port. Over buffers the caller owns, with no allocation and no serial port."
+license     = "Apache-2.0"
+stability   = "experimental"
+category    = "networking"
+layer       = "core"
+tags        = ["ppp", "rfc1661", "rfc1662", "lcp", "ipcp", "ipv6cp", "pap", "chap", "modem", "cellular", "hdlc", "embedded", "sans-io", "no-alloc"]
+repository  = "https://github.com/novolang/ppp-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.24.0"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "PPP over a cellular modem's serial port, as a session the caller drives"
+
+[dependencies]
+# None.  The frame check sequences are this package's own tables, because
+# crc-nv has the CRC-32 but not the CRC-16 of X.25, and MD5 for CHAP is this
+# package's own too: the standard library's is a hex string and is not
+# admitted at the embedded tier.

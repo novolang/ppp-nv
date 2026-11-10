@@ -1,0 +1,120 @@
+// pppfcs_tests.nv — the frame check sequences of RFC 1662 Appendix C.
+//
+// What the tests hold the tables and the update functions to:
+//
+//   - The 16-bit table is the one RFC 1662 prints as `fcstab`.  Its first
+//     entries are 0x0000, 0x1189, 0x2312, 0x329B, and its last is 0x0F78.
+//     Every entry is also recomputed here from the polynomial: the
+//     reflected constant is 0x8408, and the entry for index n is n shifted
+//     right eight times, exclusive-or the constant after each shift that
+//     dropped a one.  The 32-bit table is recomputed the same way from
+//     0xEDB88320.
+//   - The catalogue's check values for the nine ASCII characters
+//     "123456789": CRC-16/IBM-SDLC (the X.25 CRC) is 0x906E and CRC-32 is
+//     0xCBF43926.  The running register before the final complement is
+//     0x6F91 and 0x340BC6D9.
+//   - The receipt check of Appendix C: fold the message and then its FCS,
+//     low byte first, and the register is 0xF0B8 (16 bit) or 0xDEBB20E3
+//     (32 bit), whatever the message.
+
+use std.list
+use std.test
+use pppfcs
+
+// The running FCS-16 over a list of bytes.
+fn run16(xs: [Int]) -> Int
+    var f = pppfcs.PPP_FCS16_INIT
+    for b in xs
+        f = pppfcs.fcs16_update(f, b)
+    f
+
+// The running FCS-32 over a list of bytes.
+fn run32(xs: [Int]) -> Int
+    var f = pppfcs.PPP_FCS32_INIT
+    for b in xs
+        f = pppfcs.fcs32_update(f, b)
+    f
+
+// "123456789".
+fn nine() -> [Int]
+    [0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39]
+
+@test
+fn test_the_constants_are_those_of_the_rfc() [io]
+    test.assert_eq(pppfcs.PPP_FCS16_INIT, 0xFFFF)
+    test.assert_eq(pppfcs.PPP_FCS16_GOOD, 0xF0B8)
+    test.assert_eq(pppfcs.PPP_FCS32_INIT, 0xFFFFFFFF)
+    test.assert_eq(pppfcs.PPP_FCS32_GOOD, 0xDEBB20E3)
+
+@test
+fn test_the_16_bit_table_starts_and_ends_as_the_rfc_prints_it() [io]
+    test.assert_eq(pppfcs.FCS16_TABLE[0], 0x0000)
+    test.assert_eq(pppfcs.FCS16_TABLE[1], 0x1189)
+    test.assert_eq(pppfcs.FCS16_TABLE[2], 0x2312)
+    test.assert_eq(pppfcs.FCS16_TABLE[3], 0x329B)
+    test.assert_eq(pppfcs.FCS16_TABLE[255], 0x0F78)
+
+@test
+fn test_every_entry_of_the_16_bit_table_follows_from_the_polynomial() [io]
+    for n in 0..256
+        var v = n
+        for _i in 0..8
+            if (v & 1) == 1
+                v = (v >> 1) ^ 0x8408
+            else
+                v = v >> 1
+        test.assert_eq(pppfcs.FCS16_TABLE[n], v)
+
+@test
+fn test_every_entry_of_the_32_bit_table_follows_from_the_polynomial() [io]
+    for n in 0..256
+        var v = n
+        for _i in 0..8
+            if (v & 1) == 1
+                v = (v >> 1) ^ 0xEDB88320
+            else
+                v = v >> 1
+        test.assert_eq(pppfcs.FCS32_TABLE[n], v)
+
+@test
+fn test_the_16_bit_check_value() [io]
+    test.assert_eq(run16(nine()), 0x6F91)
+    test.assert_eq(pppfcs.fcs16_wire(run16(nine())), 0x906E)
+
+@test
+fn test_the_32_bit_check_value() [io]
+    test.assert_eq(run32(nine()), 0x340BC6D9)
+    test.assert_eq(pppfcs.fcs32_wire(run32(nine())), 0xCBF43926)
+
+@test
+fn test_the_empty_message() [io]
+    // Nothing folded: the register is the initial value and the wire FCS
+    // is its complement, zero.
+    test.assert_eq(run16([]), 0xFFFF)
+    test.assert_eq(pppfcs.fcs16_wire(0xFFFF), 0x0000)
+    test.assert_eq(pppfcs.fcs32_wire(0xFFFFFFFF), 0x00000000)
+
+@test
+fn test_the_receipt_check_of_appendix_c_16_bit() [io]
+    // A message followed by its FCS, low byte first, leaves 0xF0B8.
+    var msgs: [[Int]] = [nine(), [0xFF, 0x03, 0xC0, 0x21], [0x00], [0x7E, 0x7D, 0xFF]]
+    for m in msgs
+        let fcs = pppfcs.fcs16_wire(run16(m))
+        let all = list.concat(m, [fcs & 0xFF, (fcs >> 8) & 0xFF])
+        test.assert_eq(run16(all), pppfcs.PPP_FCS16_GOOD)
+
+@test
+fn test_the_receipt_check_of_appendix_c_32_bit() [io]
+    var msgs: [[Int]] = [nine(), [0xFF, 0x03, 0xC0, 0x21], [0x00], [0x7E, 0x7D, 0xFF]]
+    for m in msgs
+        let fcs = pppfcs.fcs32_wire(run32(m))
+        let all = list.concat(m, [fcs & 0xFF, (fcs >> 8) & 0xFF, (fcs >> 16) & 0xFF, (fcs >> 24) & 0xFF])
+        test.assert_eq(run32(all), pppfcs.PPP_FCS32_GOOD)
+
+@test
+fn test_a_changed_byte_changes_the_fcs() [io]
+    var a = nine()
+    var b = nine()
+    b[4] = 0x36
+    test.assert_ne(run16(a), run16(b))
+    test.assert_ne(run32(a), run32(b))

@@ -1,0 +1,533 @@
+// pppframe_tests.nv — the frame of RFC 1662, byte for byte.
+//
+// The expected frames were worked out by hand and checked with a separate
+// program that computes the CRC one bit at a time, so that no table is in
+// the loop.  Each is written in the same steps:
+//
+//   1. the body: address FF, control 03, the protocol (two bytes unless
+//      compressed), the information;
+//   2. the FCS over the body, low byte first, appended;
+//   3. every byte of body and FCS that is 7E, 7D or a control character in
+//      the ACCM replaced by 7D and the byte exclusive-or 20;
+//   4. a flag 7E at each end.
+//
+// V1, an LCP Configure-Request (code 1, id 1, length 16) with the ACCM
+// option 0 (02 06 00000000) and the magic number 12345678 (05 06 12345678):
+//
+//     body  FF 03 C0 21 | 01 01 00 10 02 06 00 00 00 00 05 06 12 34 56 78
+//     FCS   A4 F0
+//     wire  7E FF 7D 23 C0 21 7D 21 7D 21 7D 20 7D 30 7D 22 7D 26 7D 20
+//           7D 20 7D 20 7D 20 7D 25 7D 26 7D 32 34 56 78 A4 F0 7E
+//
+// Every control character is escaped: 03 as 7D 23, 01 as 7D 21, 00 as
+// 7D 20, 10 as 7D 30, 02 as 7D 22, 06 as 7D 26, 05 as 7D 25 and 12 as
+// 7D 32.  The rest of the vectors are listed beside the tests that use them.
+
+use std.list
+use std.test
+use pppfcs
+use pppframe
+
+// An information field from a list of byte values.
+fn info_of(xs: [Int]) -> pppframe.PppInfo
+    var m: pppframe.PppInfo = Vec.new()
+    for x in xs
+        let _ = m.push(x as u8)
+    m
+
+// The bytes of a wire buffer as a list.
+fn list_of(var w: pppframe.PppWire) -> [Int]
+    var out: [Int] = []
+    for i in 0..w.len()
+        list.push(out, w[i] as Int)
+    out
+
+// The frame `encode` writes for a protocol, information and options.
+fn wire_of(proto: Int, xs: [Int], o: pppframe.PppFrameOpts) -> [Int]
+    var info = info_of(xs)
+    var w: pppframe.PppWire = Vec.new()
+    let _ = pppframe.frame_encode(proto, var info, o, var w)
+    list_of(var w)
+
+// The options of a sender after LCP: an ACCM, and the compressions.
+fn opts(accm: Int, acfc: Bool, pfc: Bool, fcs32: Bool) -> pppframe.PppFrameOpts
+    pppframe.PppFrameOpts { accm: accm, acfc: acfc, pfc: pfc, fcs32: fcs32 }
+
+// Feed bytes to a receiver and answer the last event that was not NONE, or
+// NONE when there was none.
+fn feed(var rx: pppframe.PppRx, xs: [Int]) -> Int
+    var last = pppframe.PPP_RX_NONE
+    for b in xs
+        let ev = pppframe.rx_byte(var rx, b)
+        if ev != pppframe.PPP_RX_NONE
+            last = ev
+    last
+
+// The information of the receiver's frame as a list.
+fn buf_list(var rx: pppframe.PppRx) -> [Int]
+    var out: [Int] = []
+    for i in 0..rx.buf.len()
+        list.push(out, rx.buf[i] as Int)
+    out
+
+// The list with `v` inserted before index `at`.
+fn with_inserted(xs: [Int], at: Int, v: Int) -> [Int]
+    list.concat(list.concat(list.slice(xs, 0, at), [v]), list.slice(xs, at, list.len(xs)))
+
+// A frame for a body (address, control, protocol and information) with its
+// 16-bit FCS appended, every control character escaped, and flags at each
+// end, written without `frame_encode` so that it can be longer than the
+// limit.
+fn raw_frame(body: [Int]) -> [Int]
+    var f = pppfcs.PPP_FCS16_INIT
+    for b in body
+        f = pppfcs.fcs16_update(f, b)
+    let fcs = pppfcs.fcs16_wire(f)
+    var out: [Int] = [0x7E]
+    for b in list.concat(body, [fcs & 0xFF, (fcs >> 8) & 0xFF])
+        if b == 0x7E or b == 0x7D or b < 0x20
+            list.push(out, 0x7D)
+            list.push(out, b ^ 0x20)
+        else
+            list.push(out, b)
+    list.push(out, 0x7E)
+    out
+
+// V1 as a list.
+fn v1() -> [Int]
+    [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x21, 0x7D, 0x21, 0x7D, 0x20, 0x7D, 0x30, 0x7D, 0x22,
+     0x7D, 0x26, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x25, 0x7D, 0x26, 0x7D, 0x32,
+     0x34, 0x56, 0x78, 0xA4, 0xF0, 0x7E]
+
+// V1's information field.
+fn v1_info() -> [Int]
+    [0x01, 0x01, 0x00, 0x10, 0x02, 0x06, 0x00, 0x00, 0x00, 0x00, 0x05, 0x06, 0x12, 0x34, 0x56, 0x78]
+
+// V2, an IP datagram of seven bytes, 01 7E 7D 00 11 13 1F, sent with the
+// address and control and the protocol compressed, an ACCM of 000A0000
+// (the XON 11 and XOFF 13 are escaped) and a 16-bit FCS:
+//
+//     body  21 | 01 7E 7D 00 11 13 1F      FCS 0B 36
+//     wire  7E 21 01 7D 5E 7D 5D 00 7D 31 7D 33 1F 0B 36 7E
+fn v2() -> [Int]
+    [0x7E, 0x21, 0x01, 0x7D, 0x5E, 0x7D, 0x5D, 0x00, 0x7D, 0x31, 0x7D, 0x33, 0x1F, 0x0B, 0x36, 0x7E]
+
+// V3, the same datagram with a 32-bit FCS:
+//
+//     body  21 | 01 7E 7D 00 11 13 1F      FCS FA 7B E0 37
+//     wire  7E 21 01 7D 5E 7D 5D 00 7D 31 7D 33 1F FA 7B E0 37 7E
+fn v3() -> [Int]
+    [0x7E, 0x21, 0x01, 0x7D, 0x5E, 0x7D, 0x5D, 0x00, 0x7D, 0x31, 0x7D, 0x33, 0x1F, 0xFA, 0x7B, 0xE0,
+     0x37, 0x7E]
+
+// The datagram of V2 and V3.
+fn dgram() -> [Int]
+    [0x01, 0x7E, 0x7D, 0x00, 0x11, 0x13, 0x1F]
+
+// ── The sender ─────────────────────────────────────────────────────
+
+@test
+fn test_the_defaults_escape_everything_and_compress_nothing() [io]
+    let o = pppframe.opts_default()
+    test.assert_eq(o.accm, 0xFFFFFFFF)
+    test.assert_eq(o.acfc, false)
+    test.assert_eq(o.pfc, false)
+    test.assert_eq(o.fcs32, false)
+
+@test
+fn test_v1_an_lcp_configure_request() [io]
+    test.assert_eq(wire_of(0xC021, v1_info(), pppframe.opts_default()), v1())
+
+@test
+fn test_v2_compressed_with_a_16_bit_fcs() [io]
+    test.assert_eq(wire_of(0x0021, dgram(), opts(0xA0000, true, true, false)), v2())
+
+@test
+fn test_v3_compressed_with_a_32_bit_fcs() [io]
+    test.assert_eq(wire_of(0x0021, dgram(), opts(0xA0000, true, true, true)), v3())
+
+@test
+fn test_v4_an_lcp_negotiating_packet_ignores_the_options() [io]
+    // ACCM 0, ACFC and PFC all on: the frame is still V1.
+    test.assert_eq(wire_of(0xC021, v1_info(), opts(0, true, true, false)), v1())
+
+@test
+fn test_every_negotiating_code_ignores_the_options() [io]
+    // Codes 1 to 7 of LCP get the full header and every escape.  The same
+    // packet with code 8 or 9 does not.
+    for code in 1..8
+        let full = wire_of(0xC021, [code, 0x42, 0x00, 0x04], pppframe.opts_default())
+        test.case("code ${code}")
+        test.assert_eq(wire_of(0xC021, [code, 0x42, 0x00, 0x04], opts(0, true, true, false)), full)
+    let c8 = wire_of(0xC021, [8, 0x42, 0x00, 0x04], opts(0, true, true, false))
+    test.assert_eq(c8[1], 0xC0)
+
+@test
+fn test_v5_an_echo_request_is_compressed() [io]
+    // Code 9: ACFC applies and there is no address or control; the protocol
+    // C021 is above 0xFF, so PFC leaves it as two bytes.
+    //     body  C0 21 | 09 42 00 08 DE AD BE EF      FCS BA 35
+    test.assert_eq(wire_of(0xC021, [0x09, 0x42, 0x00, 0x08, 0xDE, 0xAD, 0xBE, 0xEF], opts(0, true, true, false)),
+                   [0x7E, 0xC0, 0x21, 0x09, 0x42, 0x00, 0x08, 0xDE, 0xAD, 0xBE, 0xEF, 0xBA, 0x35, 0x7E])
+
+@test
+fn test_v6_an_ipcp_request_with_acfc() [io]
+    //     body  80 21 | 01 01 00 04      FCS BB 99
+    test.assert_eq(wire_of(0x8021, [0x01, 0x01, 0x00, 0x04], opts(0, true, true, false)),
+                   [0x7E, 0x80, 0x21, 0x01, 0x01, 0x00, 0x04, 0xBB, 0x99, 0x7E])
+
+@test
+fn test_v7_a_datagram_of_nothing_with_the_full_header() [io]
+    //     body  FF 03 00 21      FCS E3 E6
+    test.assert_eq(wire_of(0x0021, [], opts(0, false, false, false)),
+                   [0x7E, 0xFF, 0x03, 0x00, 0x21, 0xE3, 0xE6, 0x7E])
+
+@test
+fn test_v8_the_default_map_escapes_the_zero_in_the_protocol() [io]
+    //     body  FF 03 00 21 45 00      FCS 50 76
+    test.assert_eq(wire_of(0x0021, [0x45, 0x00], pppframe.opts_default()),
+                   [0x7E, 0xFF, 0x7D, 0x23, 0x7D, 0x20, 0x21, 0x45, 0x7D, 0x20, 0x50, 0x76, 0x7E])
+
+@test
+fn test_pfc_does_not_shorten_a_protocol_above_ff() [io]
+    let w = wire_of(0x8021, [0x01, 0x01, 0x00, 0x04], opts(0, false, true, false))
+    test.assert_eq(w[3], 0x80)
+    test.assert_eq(w[4], 0x21)
+
+@test
+fn test_the_fcs_is_escaped_like_the_rest() [io]
+    // Find a frame whose FCS holds a byte that needs escaping: V8 has FCS
+    // bytes 50 76; here the payload is varied until one of the two FCS
+    // bytes is 7E or 7D or, under the default map, a control character.
+    var found = false
+    for n in 0..200
+        let w = wire_of(0x0021, [n], pppframe.opts_default())
+        // Two bytes before the closing flag are the FCS, or three if the
+        // second of them was escaped.
+        let k = list.len(w)
+        if w[k - 3] == 0x7D
+            found = true
+            // An escaped byte is two bytes, the escape and the byte
+            // exclusive-or 20, and is never itself 7E.
+            test.assert_ne(w[k - 2], 0x7E)
+    test.assert_eq(found, true)
+
+@test
+fn test_frames_are_appended_and_each_has_its_own_flags() [io]
+    var a = info_of([0x01, 0x01, 0x00, 0x04])
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppframe.frame_encode(0x8021, var a, opts(0, true, true, false), var w), true)
+    test.assert_eq(pppframe.frame_encode(0x8021, var a, opts(0, true, true, false), var w), true)
+    test.assert_eq(list_of(var w),
+                   [0x7E, 0x80, 0x21, 0x01, 0x01, 0x00, 0x04, 0xBB, 0x99, 0x7E,
+                    0x7E, 0x80, 0x21, 0x01, 0x01, 0x00, 0x04, 0xBB, 0x99, 0x7E])
+
+@test
+fn test_an_information_field_over_the_limit_is_refused() [io]
+    var big: pppframe.PppInfo = Vec.new()
+    for _i in 0..1501
+        let _ = big.push(0x55)
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppframe.frame_encode(0x0021, var big, pppframe.opts_default(), var w), false)
+    test.assert_eq(w.len(), 0)
+
+@test
+fn test_a_frame_of_the_limit_goes_round_with_every_byte_escaped() [io]
+    var big: pppframe.PppInfo = Vec.new()
+    for _i in 0..1500
+        let _ = big.push(0x7E)
+    var w: pppframe.PppWire = Vec.new()
+    test.assert_eq(pppframe.frame_encode(0x0021, var big, opts(0xFFFFFFFF, false, false, true), var w), true)
+    test.assert_eq(w.len() <= pppframe.PPP_WIRE_MAX, true)
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_fcs32(var rx, true)
+    var last = 0
+    for i in 0..w.len()
+        last = pppframe.rx_byte(var rx, w[i] as Int)
+    test.assert_eq(last, pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.buf.len(), 1500)
+    test.assert_eq(rx.buf[1499], 0x7E)
+
+@test
+fn test_a_frame_that_does_not_fit_leaves_the_buffer_alone() [io]
+    var w: pppframe.PppWire = Vec.new()
+    for _i in 0..(pppframe.PPP_WIRE_MAX - 12)
+        let _ = w.push(0x55)
+    var info = info_of([0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E, 0x7E])
+    // The frame needs more than the 12 bytes that are free.
+    test.assert_eq(pppframe.frame_encode(0x0021, var info, pppframe.opts_default(), var w), false)
+    test.assert_eq(w.len(), pppframe.PPP_WIRE_MAX - 12)
+    test.assert_eq(w[w.len() - 1], 0x55)
+
+@test
+fn test_a_full_buffer_refuses_even_the_flag() [io]
+    var w: pppframe.PppWire = Vec.new()
+    for _i in 0..pppframe.PPP_WIRE_MAX
+        let _ = w.push(0x55)
+    var info = info_of([0x01])
+    test.assert_eq(pppframe.frame_encode(0x0021, var info, pppframe.opts_default(), var w), false)
+    test.assert_eq(w.len(), pppframe.PPP_WIRE_MAX)
+
+@test
+fn test_a_frame_that_just_fits_is_written() [io]
+    // V2 is 16 bytes.
+    var w: pppframe.PppWire = Vec.new()
+    for _i in 0..(pppframe.PPP_WIRE_MAX - 16)
+        let _ = w.push(0x55)
+    var info = info_of(dgram())
+    test.assert_eq(pppframe.frame_encode(0x0021, var info, opts(0xA0000, true, true, false), var w), true)
+    test.assert_eq(w.len(), pppframe.PPP_WIRE_MAX)
+    var one_short: pppframe.PppWire = Vec.new()
+    for _i in 0..(pppframe.PPP_WIRE_MAX - 15)
+        let _ = one_short.push(0x55)
+    test.assert_eq(pppframe.frame_encode(0x0021, var info, opts(0xA0000, true, true, false), var one_short), false)
+
+// ── The receiver ───────────────────────────────────────────────────
+
+@test
+fn test_v1_is_received() [io]
+    var rx = pppframe.rx_new()
+    test.assert_eq(feed(var rx, v1()), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.proto, 0xC021)
+    test.assert_eq(buf_list(var rx), v1_info())
+    test.assert_eq(rx.frames, 1)
+    test.assert_eq(rx.errors, 0)
+
+@test
+fn test_v2_is_received_with_no_address_and_a_one_byte_protocol() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    test.assert_eq(feed(var rx, v2()), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.proto, 0x0021)
+    test.assert_eq(buf_list(var rx), dgram())
+
+@test
+fn test_v3_is_received_with_a_32_bit_fcs() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    pppframe.rx_set_fcs32(var rx, true)
+    test.assert_eq(feed(var rx, v3()), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.proto, 0x0021)
+    test.assert_eq(buf_list(var rx), dgram())
+
+@test
+fn test_a_32_bit_frame_is_bad_to_a_16_bit_receiver() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    test.assert_eq(feed(var rx, v3()), pppframe.PPP_RX_BAD_FCS)
+
+@test
+fn test_every_vector_the_sender_writes_is_received() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0)
+    test.assert_eq(feed(var rx, wire_of(0xC021, [0x09, 0x42, 0x00, 0x08, 0xDE, 0xAD, 0xBE, 0xEF], opts(0, true, true, false))),
+                   pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.proto, 0xC021)
+    test.assert_eq(rx.buf.len(), 8)
+    test.assert_eq(feed(var rx, wire_of(0x8021, [0x01, 0x01, 0x00, 0x04], opts(0, true, true, false))),
+                   pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.proto, 0x8021)
+    test.assert_eq(feed(var rx, wire_of(0x0021, [], opts(0, false, false, false))), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.buf.len(), 0)
+    test.assert_eq(rx.frames, 3)
+
+@test
+fn test_the_frame_stays_until_the_next_byte() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    test.assert_eq(feed(var rx, v2()), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.buf.len(), 7)
+    test.assert_eq(pppframe.rx_byte(var rx, 0x7E), pppframe.PPP_RX_NONE)
+    test.assert_eq(rx.buf.len(), 0)
+
+@test
+fn test_a_single_flag_between_frames_serves_both() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    // V2's closing flag is V2's opening flag again, so the second frame
+    // has no flag of its own.
+    var both = v2()
+    let again = v2()
+    for i in 1..list.len(again)
+        list.push(both, again[i])
+    var frames = 0
+    for b in both
+        if pppframe.rx_byte(var rx, b) == pppframe.PPP_RX_FRAME
+            frames = frames + 1
+    test.assert_eq(frames, 2)
+
+@test
+fn test_flags_alone_are_fill() [io]
+    var rx = pppframe.rx_new()
+    test.assert_eq(feed(var rx, [0x7E, 0x7E, 0x7E, 0x7E]), pppframe.PPP_RX_NONE)
+    test.assert_eq(rx.frames, 0)
+    test.assert_eq(rx.errors, 0)
+
+@test
+fn test_an_escape_and_a_flag_abort_the_frame() [io]
+    var rx = pppframe.rx_new()
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x7D, 0x7E]), pppframe.PPP_RX_ABORT)
+    test.assert_eq(rx.errors, 1)
+    // The flag that aborted it opens the next frame: V1 without its own
+    // opening flag is received.
+    test.assert_eq(feed(var rx, list.slice(v1(), 1, list.len(v1()))), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.frames, 1)
+
+@test
+fn test_a_frame_after_an_abort_is_received() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    test.assert_eq(feed(var rx, [0x7E, 0x45, 0x7D, 0x7E]), pppframe.PPP_RX_ABORT)
+    test.assert_eq(feed(var rx, v2()), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.proto, 0x0021)
+
+@test
+fn test_a_bad_fcs_is_reported_at_the_flag() [io]
+    var rx = pppframe.rx_new()
+    var w = v1()
+    // Change the last information byte, 78, to 79.
+    w[34] = 0x79
+    test.assert_eq(feed(var rx, w), pppframe.PPP_RX_BAD_FCS)
+    test.assert_eq(rx.errors, 1)
+    test.assert_eq(rx.frames, 0)
+    test.assert_eq(rx.buf.len(), 0)
+
+@test
+fn test_a_runt_frame_is_reported() [io]
+    var rx = pppframe.rx_new()
+    // Flag, address, flag: the control never came.
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x7E]), pppframe.PPP_RX_RUNT)
+    // Address, control, protocol, and a flag: no FCS.
+    test.assert_eq(feed(var rx, [0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7E]), pppframe.PPP_RX_RUNT)
+    // The protocol 0021 and one byte: less than a 16-bit FCS.
+    test.assert_eq(feed(var rx, [0x7E, 0x21, 0x45, 0x7E]), pppframe.PPP_RX_RUNT)
+    test.assert_eq(rx.errors, 3)
+
+@test
+fn test_a_wrong_control_is_a_bad_header() [io]
+    var rx = pppframe.rx_new()
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x04, 0x00, 0x21, 0x45, 0x00, 0x00, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
+    test.assert_eq(rx.errors, 1)
+
+@test
+fn test_a_protocol_whose_second_byte_is_even_is_a_bad_header() [io]
+    var rx = pppframe.rx_new()
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x03, 0x00, 0x20, 0x45, 0x00, 0x00, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
+
+@test
+fn test_the_receiver_resynchronises_after_a_bad_header() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x04, 0x00, 0x21, 0x7E]), pppframe.PPP_RX_BAD_HEADER)
+    test.assert_eq(feed(var rx, v2()), pppframe.PPP_RX_FRAME)
+
+@test
+fn test_a_frame_longer_than_the_buffer_is_too_long() [io]
+    var rx = pppframe.rx_new()
+    var w: [Int] = [0x7E, 0xFF, 0x7D, 0x23, 0x00, 0x21]
+    for _i in 0..1510
+        list.push(w, 0x55)
+    list.push(w, 0x7E)
+    test.assert_eq(feed(var rx, w), pppframe.PPP_RX_TOO_LONG)
+    test.assert_eq(rx.errors, 1)
+    test.assert_eq(rx.over, false)
+
+@test
+fn test_an_information_field_one_over_the_limit_is_too_long() [io]
+    // A frame whose FCS is right and whose information is 1501 bytes: it
+    // fits the buffer with its FCS, and is refused for its length.
+    var rx = pppframe.rx_new()
+    var body: [Int] = [0xFF, 0x03, 0x00, 0x21]
+    for _i in 0..1501
+        list.push(body, 0x55)
+    test.assert_eq(feed(var rx, raw_frame(body)), pppframe.PPP_RX_TOO_LONG)
+
+@test
+fn test_an_information_field_of_the_limit_is_received() [io]
+    var rx = pppframe.rx_new()
+    var body: [Int] = [0xFF, 0x03, 0x00, 0x21]
+    for _i in 0..1500
+        list.push(body, 0x55)
+    test.assert_eq(feed(var rx, raw_frame(body)), pppframe.PPP_RX_FRAME)
+    test.assert_eq(rx.buf.len(), 1500)
+
+@test
+fn test_a_control_character_the_map_names_is_dropped_unescaped() [io]
+    // XON and XOFF inserted into V2 by a terminal server: the receiver's
+    // map names them, so they are not data.
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    let w = with_inserted(with_inserted(v2(), 5, 0x11), 9, 0x13)
+    test.assert_eq(feed(var rx, w), pppframe.PPP_RX_FRAME)
+    test.assert_eq(buf_list(var rx), dgram())
+
+@test
+fn test_a_control_character_outside_the_map_is_data() [io]
+    // With a map of 0 the 00 and 1F in V2 are data, as is an unescaped 11.
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0)
+    // V2 is built for the map 000A0000, so its bytes are valid for a map
+    // of 0 too; an XON that appears is taken as data and spoils the FCS.
+    let w = with_inserted(v2(), 5, 0x11)
+    test.assert_eq(feed(var rx, w), pppframe.PPP_RX_BAD_FCS)
+
+@test
+fn test_a_receiver_with_a_map_of_zero_takes_v2() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0)
+    test.assert_eq(feed(var rx, v2()), pppframe.PPP_RX_FRAME)
+
+@test
+fn test_rx_reset_forgets_the_frame_and_keeps_the_counters() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    test.assert_eq(feed(var rx, v2()), pppframe.PPP_RX_FRAME)
+    test.assert_eq(feed(var rx, [0x7E, 0xFF, 0x03]), pppframe.PPP_RX_NONE)
+    pppframe.rx_reset(var rx)
+    test.assert_eq(rx.started, false)
+    test.assert_eq(rx.frames, 1)
+    // The partial frame is gone: a closing flag now is only fill.
+    test.assert_eq(pppframe.rx_byte(var rx, 0x7E), pppframe.PPP_RX_NONE)
+
+@test
+fn test_only_the_low_eight_bits_of_a_byte_are_read() [io]
+    var rx = pppframe.rx_new()
+    pppframe.rx_set_accm(var rx, 0xA0000)
+    var w: [Int] = []
+    for b in v2()
+        list.push(w, b + 0x100)
+    test.assert_eq(feed(var rx, w), pppframe.PPP_RX_FRAME)
+
+@test
+fn test_random_frames_go_round_under_random_options() [io]
+    // The sender and the receiver agree for a few hundred generated
+    // frames: random protocol, random information weighted toward the
+    // bytes that need escaping, every combination of options.
+    var s = 17
+    var rx = pppframe.rx_new()
+    for round in 0..300
+        s = (s * 1103515245 + 12345) & 0x7FFFFFFF
+        let n = (s >> 8) % 60
+        var xs: [Int] = []
+        for _i in 0..n
+            s = (s * 1103515245 + 12345) & 0x7FFFFFFF
+            let k = (s >> 8) % 5
+            if k == 0
+                list.push(xs, 0x7E)
+            elif k == 1
+                list.push(xs, 0x7D)
+            elif k == 2
+                list.push(xs, (s >> 12) & 0x1F)
+            else
+                list.push(xs, (s >> 12) & 0xFF)
+        let protos = [0x0021, 0x0057, 0x8021, 0xC023, 0xC221, 0x0023]
+        let proto = protos[(s >> 5) % 6]
+        let accm = (s >> 3) * 8191
+        let o = opts(accm & 0xFFFFFFFF, (s & 1) == 1, (s & 2) == 2, (s & 4) == 4)
+        pppframe.rx_set_accm(var rx, o.accm)
+        pppframe.rx_set_fcs32(var rx, o.fcs32)
+        test.case("frame ${round}")
+        let w = wire_of(proto, xs, o)
+        test.assert_eq(feed(var rx, w), pppframe.PPP_RX_FRAME)
+        test.assert_eq(rx.proto, proto)
+        test.assert_eq(buf_list(var rx), xs)

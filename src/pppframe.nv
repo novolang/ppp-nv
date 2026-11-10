@@ -1,0 +1,508 @@
+// pppframe.nv — the HDLC-like frame of RFC 1662, with no allocation.
+//
+// `[]` THROUGHOUT and `@tier(embedded)` on all of it.  On an asynchronous
+// link, a modem's serial port for one, a PPP packet travels in a frame:
+//
+//   7E  FF 03  protocol  information  FCS  7E
+//
+// The flag 0x7E opens and closes the frame.  The address 0xFF and the
+// control 0x03 never change.  The protocol is two bytes (one when it
+// is compressed), the information is the packet, and the FCS is a CRC of
+// everything between the flags (`pppfcs`).  A byte that could be mistaken
+// for framing is sent as the escape 0x7D followed by the byte exclusive-or
+// 0x20: the flag and the escape themselves always, and any control
+// character (0x00 to 0x1F) the receiver asked to have escaped in the
+// async-control-character-map, ACCM, that LCP negotiates.
+//
+// THE SENDER is `frame_encode`.  It writes one frame into a caller's wire
+// buffer, flag to flag, applying the options in `PppFrameOpts`: the ACCM of
+// the peer's receiver, the compression of the address and control fields
+// (ACFC, section 6.5 of RFC 1661) and of the protocol field (PFC, section
+// 6.6), and the 32-bit FCS.  RFC 1661 section 5 requires that LCP packets
+// with codes 1 to 7, the ones that negotiate, are sent as though no option
+// had been agreed, so `frame_encode` sends those with the full header and
+// every control character escaped, whatever the options say.
+//
+// THE RECEIVER is `PppRx`, a byte at a time, as `sliprx` is for SLIP.  It
+// unescapes, folds each byte into the FCS, and at the closing flag answers
+// whether a frame arrived, with the protocol number in `rx.proto` and the
+// information in `rx.buf`.  It takes the address and control bytes or
+// leaves them out, and a protocol of one byte or two, whatever was
+// negotiated, because a receiver that is strict about it is a receiver that
+// loses frames from a peer that is not.  A frame is reported once it is
+// closed: a good one, or the fault that spoiled it.
+//
+// THE ABORT.  The escape followed by a flag aborts the frame in progress
+// (section 4.3).  The receiver answers `PPP_RX_ABORT` and the flag starts
+// the next frame.  Two flags in a row are the fill between frames and
+// answer nothing.
+//
+// UNESCAPED CONTROL CHARACTERS.  A control character that the receiver's
+// own ACCM says should have been escaped, arriving without its escape, is
+// not data: a modem or a terminal server may have put it there (XON and XOFF
+// for flow control, for one), and the receiver drops it (section 4.2).  The
+// ACCM a receiver starts with is 0xFFFFFFFF, so until the caller says what
+// LCP agreed, a frame must come with its control characters escaped.
+//
+// This module carries bytes and decides nothing about them.  What the
+// protocol numbers mean is `pppsess`.
+
+use pppfcs
+
+// The byte that opens and closes a frame: 0x7E.
+pub const PPP_FLAG = 0x7E
+// The byte that starts an escape: 0x7D.
+pub const PPP_ESC = 0x7D
+// What the byte after an escape is exclusive-ored with: 0x20.
+pub const PPP_XOR = 0x20
+// The address field of every frame: 0xFF.
+pub const PPP_ADDR = 0xFF
+// The control field of every frame: 0x03.
+pub const PPP_CTRL = 0x03
+
+// The longest information field this package reads or writes, in bytes:
+// 1500, the default MRU of RFC 1661.
+pub const PPP_INFO_MAX = 1500
+// The size of the buffer that holds an information field and, while a frame
+// is being received, its FCS of up to four bytes.
+pub const PPP_BUF_MAX = 1504
+// The most bytes one frame takes on the wire: the longest header, an
+// information field of `PPP_INFO_MAX` and a 32-bit FCS, 1508 bytes, every
+// one escaped, and the two flags.
+pub const PPP_WIRE_MAX = 3018
+
+// Protocol 0x0021: an IPv4 datagram.
+pub const PPP_P_IP = 0x0021
+// Protocol 0x0057: an IPv6 datagram.
+pub const PPP_P_IPV6 = 0x0057
+// Protocol 0x8021: the IP Control Protocol.
+pub const PPP_P_IPCP = 0x8021
+// Protocol 0x8057: the IPv6 Control Protocol.
+pub const PPP_P_IPV6CP = 0x8057
+// Protocol 0xC021: the Link Control Protocol.
+pub const PPP_P_LCP = 0xC021
+// Protocol 0xC023: the Password Authentication Protocol.
+pub const PPP_P_PAP = 0xC023
+// Protocol 0xC223: the Challenge Handshake Authentication Protocol.
+pub const PPP_P_CHAP = 0xC223
+
+// `rx_byte`: the byte was taken and no frame is complete.
+pub const PPP_RX_NONE = 0
+// `rx_byte`: a frame with a good FCS is complete.
+pub const PPP_RX_FRAME = 1
+// `rx_byte`: a frame ended and its FCS was wrong.
+pub const PPP_RX_BAD_FCS = 2
+// `rx_byte`: the frame was aborted with an escape and a flag.
+pub const PPP_RX_ABORT = 3
+// `rx_byte`: a frame ended before its header and FCS were complete.
+pub const PPP_RX_RUNT = 4
+// `rx_byte`: a frame ended that was longer than the buffer.
+pub const PPP_RX_TOO_LONG = 5
+// `rx_byte`: a frame ended whose address, control or protocol field is not
+// one PPP allows.
+pub const PPP_RX_BAD_HEADER = 6
+
+// A buffer for an information field: the type every packet is built in.
+pub alias PppInfo = Vec[u8; PPP_BUF_MAX]
+// A buffer for the bytes of the wire.
+pub alias PppWire = Vec[u8; PPP_WIRE_MAX]
+
+// What the sender applies to a frame.
+pub @value
+struct PppFrameOpts
+    // The peer's async-control-character-map: bit n set means the control
+    // character n is escaped.
+    accm: Int
+    // Whether to leave out the address and control fields.
+    acfc: Bool
+    // Whether to send a protocol below 0x100 as one byte.
+    pfc: Bool
+    // Whether the FCS is 32 bits.
+    fcs32: Bool
+
+// The options before anything is negotiated: every control character
+// escaped, the full header, and a 16-bit FCS.
+//
+// ```novo
+// use pppframe
+//
+// fn main() [io]
+//     let o = pppframe.opts_default()
+//     println("${o.accm} ${o.acfc} ${o.pfc} ${o.fcs32}")   // 4294967295 false false false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn opts_default() -> PppFrameOpts []
+    PppFrameOpts { accm: 0xFFFFFFFF, acfc: false, pfc: false, fcs32: false }
+
+// Whether a control packet of protocol `proto` and information `info` is
+// an LCP packet that negotiates (codes 1 to 7), which is sent with the
+// default options.
+@tier(embedded)
+@no_alloc
+fn is_negotiating(proto: Int, var info: PppInfo) -> Bool []
+    if proto != PPP_P_LCP or info.len() == 0
+        return false
+    let code = info[0] as Int
+    code >= 1 and code <= 7
+
+// Write byte `b` to the wire, escaped when it is the flag, the escape or a
+// control character in `accm`, and fold it into `fcs`'s caller.  Answers
+// whether it fitted.
+@tier(embedded)
+@no_alloc
+fn put(var out: PppWire, b: Int, accm: Int) -> Bool []
+    let needs = b == PPP_FLAG or b == PPP_ESC or (b < 0x20 and ((accm >> b) & 1) == 1)
+    if needs
+        if out.len() + 2 > PPP_WIRE_MAX
+            return false
+        let _ = out.push(PPP_ESC as u8)
+        let _ = out.push((b ^ PPP_XOR) as u8)
+        return true
+    if out.len() + 1 > PPP_WIRE_MAX
+        return false
+    let _ = out.push(b as u8)
+    true
+
+// Write the frame's FCS of `n` bytes, low byte first, escaped as the rest
+// is.
+@tier(embedded)
+@no_alloc
+fn put_fcs(var out: PppWire, fcs: Int, n: Int, accm: Int) -> Bool []
+    var ok = true
+    for i in 0..n
+        ok = ok and put(var out, (fcs >> (8 * i)) & 0xFF, accm)
+    ok
+
+// Fold one byte into the running FCS of the frame being written.
+@tier(embedded)
+@no_alloc
+fn fold(fcs: Int, b: Int, wide: Bool) -> Int []
+    if wide
+        return pppfcs.fcs32_update(fcs, b)
+    pppfcs.fcs16_update(fcs, b)
+
+// Append one frame, flag to flag, carrying protocol `proto` and the
+// information in `info`, to `out`, and answer whether it fitted.
+//
+// A frame that does not fit leaves `out` as it was.  The information field
+// is at most `PPP_INFO_MAX` bytes.
+//
+// ```novo
+// use pppframe
+//
+// fn main() [io]
+//     // An IPCP Configure-Request with no options: code 1, id 1, length 4.
+//     var info: pppframe.PppInfo = Vec.new()
+//     for b in [0x01, 0x01, 0x00, 0x04]
+//         let _ = info.push(b as u8)
+//     var wire: pppframe.PppWire = Vec.new()
+//     let o = pppframe.PppFrameOpts { accm: 0, acfc: true, pfc: false, fcs32: false }
+//     let ok = pppframe.frame_encode(0x8021, var info, o, var wire)
+//     println("${ok} ${wire.len()} ${wire[1]} ${wire[2]}")   // true 10 128 33
+// ```
+pub @tier(embedded)
+@no_alloc
+fn frame_encode(proto: Int, var info: PppInfo, o: PppFrameOpts, var out: PppWire) -> Bool []
+    if info.len() > PPP_INFO_MAX
+        return false
+    let start = out.len()
+    var accm = o.accm
+    var acfc = o.acfc
+    var pfc = o.pfc
+    if is_negotiating(proto, var info)
+        accm = 0xFFFFFFFF
+        acfc = false
+        pfc = false
+    var fcs = pppfcs.PPP_FCS16_INIT
+    var fcs_len = 2
+    if o.fcs32
+        fcs = pppfcs.PPP_FCS32_INIT
+        fcs_len = 4
+    var ok = out.len() + 2 <= PPP_WIRE_MAX
+    if ok
+        let _ = out.push(PPP_FLAG as u8)
+    if not acfc
+        ok = ok and put(var out, PPP_ADDR, accm) and put(var out, PPP_CTRL, accm)
+        fcs = fold(fold(fcs, PPP_ADDR, o.fcs32), PPP_CTRL, o.fcs32)
+    if proto > 0xFF or not pfc
+        let hi = (proto >> 8) & 0xFF
+        ok = ok and put(var out, hi, accm)
+        fcs = fold(fcs, hi, o.fcs32)
+    ok = ok and put(var out, proto & 0xFF, accm)
+    fcs = fold(fcs, proto & 0xFF, o.fcs32)
+    for i in 0..info.len()
+        let b = info[i] as Int
+        ok = ok and put(var out, b, accm)
+        fcs = fold(fcs, b, o.fcs32)
+    if o.fcs32
+        ok = ok and put_fcs(var out, pppfcs.fcs32_wire(fcs), fcs_len, accm)
+    else
+        ok = ok and put_fcs(var out, pppfcs.fcs16_wire(fcs), fcs_len, accm)
+    if ok and out.len() < PPP_WIRE_MAX
+        let _ = out.push(PPP_FLAG as u8)
+    else
+        ok = false
+    if not ok
+        let excess = out.len() - start
+        for _i in 0..excess
+            let _ = out.pop()
+    ok
+
+// The state of the receiver between two flags.
+//
+// Waiting for the first byte, which is the address or the first byte of the
+// protocol.
+const RX_ADDR = 0
+// The address was seen; the control comes next.
+const RX_CTRL = 1
+// The first byte of the protocol comes next.
+const RX_PROTO1 = 2
+// The second byte of the protocol comes next.
+const RX_PROTO2 = 3
+// The information and the FCS are arriving.
+const RX_INFO = 4
+
+// A receiver of frames: the frame being read, and what is known of it.
+//
+// The fields are readable and are not for writing; the functions of this
+// module are the only writers.
+pub @value
+struct PppRx
+    // The information field of the last frame, while `done` is true; the
+    // information and then the FCS of the frame being read otherwise.
+    buf: PppInfo
+    // The protocol of the frame.
+    proto: Int
+    // The receiver's async-control-character-map: a control character in it
+    // that arrives unescaped is dropped.
+    accm: Int
+    // Whether frames carry a 32-bit FCS.
+    fcs32: Bool
+    // Where in the header the frame has got to.
+    state: Int
+    // Whether the last byte was an escape.
+    esc: Bool
+    // The running FCS.
+    fcs: Int
+    // Whether any byte of the frame has arrived since the flag.
+    started: Bool
+    // Whether the frame ran past the buffer.
+    over: Bool
+    // Whether the frame's header is not valid.
+    bad: Bool
+    // Whether `buf` holds a frame that the next byte replaces.
+    done: Bool
+    // The frames delivered since the receiver was made.
+    frames: Int
+    // The frames lost since the receiver was made, to any fault.
+    errors: Int
+
+// A receiver with the defaults before LCP: every control character
+// expected escaped, and a 16-bit FCS.
+//
+// ```novo
+// use pppframe
+//
+// fn main() [io]
+//     let rx = pppframe.rx_new()
+//     println("${rx.accm} ${rx.fcs32} ${rx.frames}")   // 4294967295 false 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rx_new() -> PppRx []
+    PppRx { buf: Vec.new(), proto: 0, accm: 0xFFFFFFFF, fcs32: false, state: RX_ADDR, esc: false,
+            fcs: pppfcs.PPP_FCS16_INIT, started: false, over: false, bad: false, done: false,
+            frames: 0, errors: 0 }
+
+// Forget the frame being read and start the next from a clean slate.  The
+// counters, `accm` and `fcs32` stay.
+//
+// ```novo
+// use pppframe
+//
+// fn main() [io]
+//     var rx = pppframe.rx_new()
+//     let _ = pppframe.rx_byte(var rx, 0x7E)
+//     let _ = pppframe.rx_byte(var rx, 0xFF)
+//     pppframe.rx_reset(var rx)
+//     println("${rx.started}")   // false
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rx_reset(var rx: PppRx) []
+    rx.buf.clear()
+    rx.proto = 0
+    rx.state = RX_ADDR
+    rx.esc = false
+    rx.started = false
+    rx.over = false
+    rx.bad = false
+    rx.done = false
+    rx.fcs = pppfcs.PPP_FCS16_INIT
+    if rx.fcs32
+        rx.fcs = pppfcs.PPP_FCS32_INIT
+
+// Set the receiver's async-control-character-map, the control characters
+// that must arrive escaped: the value LCP agreed for this end.
+//
+// ```novo
+// use pppframe
+//
+// fn main() [io]
+//     var rx = pppframe.rx_new()
+//     pppframe.rx_set_accm(var rx, 0)
+//     println("${rx.accm}")   // 0
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rx_set_accm(var rx: PppRx, accm: Int) []
+    rx.accm = accm & 0xFFFFFFFF
+
+// Choose a 32-bit FCS (`true`) or a 16-bit one for the frames to come.
+// The frame being read, if any, is forgotten.
+//
+// ```novo
+// use pppframe
+//
+// fn main() [io]
+//     var rx = pppframe.rx_new()
+//     pppframe.rx_set_fcs32(var rx, true)
+//     println("${rx.fcs32}")   // true
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rx_set_fcs32(var rx: PppRx, on: Bool) []
+    rx.fcs32 = on
+    rx_reset(var rx)
+
+// The FCS size of the receiver: 2 or 4 bytes.
+@tier(embedded)
+@no_alloc
+fn fcs_size(var rx: PppRx) -> Int []
+    if rx.fcs32
+        return 4
+    2
+
+// Fold a data byte into the frame: the FCS, and the header or the
+// information.
+@tier(embedded)
+@no_alloc
+fn take(var rx: PppRx, c: Int) []
+    rx.started = true
+    rx.fcs = fold(rx.fcs, c, rx.fcs32)
+    if rx.bad or rx.over
+        return
+    if rx.state == RX_ADDR
+        if c == PPP_ADDR
+            rx.state = RX_CTRL
+            return
+        rx.state = RX_PROTO1
+    elif rx.state == RX_CTRL
+        if c != PPP_CTRL
+            rx.bad = true
+            return
+        rx.state = RX_PROTO1
+        return
+    if rx.state == RX_PROTO1
+        if (c & 1) == 1
+            rx.proto = c
+            rx.state = RX_INFO
+        else
+            rx.proto = c << 8
+            rx.state = RX_PROTO2
+    elif rx.state == RX_PROTO2
+        if (c & 1) == 0
+            rx.bad = true
+            return
+        rx.proto = rx.proto | c
+        rx.state = RX_INFO
+    elif rx.buf.len() < PPP_BUF_MAX
+        let _ = rx.buf.push(c as u8)
+    else
+        rx.over = true
+
+// The closing flag: answer how the frame ended and leave the receiver ready
+// for the next.
+@tier(embedded)
+@no_alloc
+fn close_frame(var rx: PppRx) -> Int []
+    if not rx.started
+        return PPP_RX_NONE
+    var event = PPP_RX_FRAME
+    let n = fcs_size(var rx)
+    var good = pppfcs.PPP_FCS16_GOOD
+    if rx.fcs32
+        good = pppfcs.PPP_FCS32_GOOD
+    if rx.bad
+        event = PPP_RX_BAD_HEADER
+    elif rx.over
+        event = PPP_RX_TOO_LONG
+    elif rx.state != RX_INFO or rx.buf.len() < n
+        event = PPP_RX_RUNT
+    elif rx.fcs != good
+        event = PPP_RX_BAD_FCS
+    elif rx.buf.len() - n > PPP_INFO_MAX
+        event = PPP_RX_TOO_LONG
+    if event != PPP_RX_FRAME
+        rx.errors = rx.errors + 1
+        rx_reset(var rx)
+        return event
+    for _i in 0..n
+        let _ = rx.buf.pop()
+    rx.frames = rx.frames + 1
+    rx.done = true
+    rx.started = false
+    rx.state = RX_ADDR
+    rx.esc = false
+    rx.fcs = pppfcs.PPP_FCS16_INIT
+    if rx.fcs32
+        rx.fcs = pppfcs.PPP_FCS32_INIT
+    PPP_RX_FRAME
+
+// Give the receiver one byte from the wire and answer what it completed:
+// `PPP_RX_NONE`, or the end of a frame as `PPP_RX_FRAME` or the fault that
+// spoiled it.
+//
+// Only the low eight bits of `b` are read.  After `PPP_RX_FRAME`, `rx.proto`
+// is the protocol and `rx.buf` the information, until the next call.
+//
+// ```novo
+// use pppframe
+//
+// fn main() [io]
+//     var rx = pppframe.rx_new()
+//     var last = 0
+//     // An LCP Configure-Request with the ACCM option 0 and the magic
+//     // number 0x12345678, as a default-ACCM sender writes it.
+//     for b in [0x7E, 0xFF, 0x7D, 0x23, 0xC0, 0x21, 0x7D, 0x21, 0x7D, 0x21, 0x7D, 0x20,
+//               0x7D, 0x30, 0x7D, 0x22, 0x7D, 0x26, 0x7D, 0x20, 0x7D, 0x20, 0x7D, 0x20,
+//               0x7D, 0x20, 0x7D, 0x25, 0x7D, 0x26, 0x7D, 0x32, 0x34, 0x56, 0x78, 0xA4,
+//               0xF0, 0x7E]
+//         last = pppframe.rx_byte(var rx, b)
+//     println("${last} ${rx.proto} ${rx.buf.len()}")   // 1 49185 16
+// ```
+pub @tier(embedded)
+@no_alloc
+fn rx_byte(var rx: PppRx, b: Int) -> Int []
+    if rx.done
+        rx_reset(var rx)
+    let c = b & 0xFF
+    if c == PPP_FLAG
+        if rx.esc
+            rx.errors = rx.errors + 1
+            rx_reset(var rx)
+            return PPP_RX_ABORT
+        return close_frame(var rx)
+    if rx.esc
+        rx.esc = false
+        take(var rx, c ^ PPP_XOR)
+        return PPP_RX_NONE
+    if c == PPP_ESC
+        rx.esc = true
+        rx.started = true
+        return PPP_RX_NONE
+    if c < 0x20 and ((rx.accm >> c) & 1) == 1
+        return PPP_RX_NONE
+    take(var rx, c)
+    PPP_RX_NONE
